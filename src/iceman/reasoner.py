@@ -431,6 +431,31 @@ def _extract_devops_action_request(
                 devops_action=DevOpsAction.K8S_DIAGNOSE_POD,
                 component=match.group(1),
             )
+    service_connectivity_patterns = (
+        r"^(?:check|test|diagnose|troubleshoot)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?service\s+([A-Za-z0-9_.-]+)\s+(?:backend\s+)?connectivity(?:\s+(?:on\s+)?port\s+(\d+))?$",
+        r"^(?:check|test|diagnose|troubleshoot)\s+(?:service-to-pod|service\s+to\s+pod)\s+connectivity\s+(?:for\s+)?(?:service\s+)?([A-Za-z0-9_.-]+)(?:\s+(?:on\s+)?port\s+(\d+))?$",
+        r"^(?:check|test|diagnose)\s+(?:the\s+)?connectivity\s+(?:for|of)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?service\s+([A-Za-z0-9_.-]+)(?:\s+(?:on\s+)?port\s+(\d+))?$",
+        r"^can\s+(?:the\s+)?service\s+([A-Za-z0-9_.-]+)\s+reach\s+(?:its\s+)?pods(?:\s+(?:on\s+)?port\s+(\d+))?$",
+    )
+    for pattern in service_connectivity_patterns:
+        match = re.match(pattern, lower)
+        if match:
+            requested_port = (
+                int(match.group(2))
+                if match.lastindex and match.lastindex >= 2 and match.group(2)
+                else None
+            )
+            return ReasoningDecision(
+                ReasoningAction.EXECUTE_DEVOPS_ACTION,
+                (
+                    "Run a bounded read-only Kubernetes Service backend "
+                    "connectivity and targetPort/listener diagnosis."
+                ),
+                devops_action=DevOpsAction.K8S_SERVICE_CONNECTIVITY,
+                component=match.group(1),
+                port=requested_port,
+            )
+
     service_diagnosis_patterns = (
         r"^(?:diagnose|troubleshoot)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?service\s+([A-Za-z0-9_.-]+)$",
         r"^(?:check\s+what(?:'s|\s+is)\s+wrong\s+with)\s+(?:the\s+)?service\s+([A-Za-z0-9_.-]+)$",

@@ -39,6 +39,7 @@ class DevOpsAction(str, Enum):
     K8S_PODS = "k8s_pods"
     K8S_DIAGNOSE_POD = "k8s_diagnose_pod"
     K8S_DIAGNOSE_SERVICE = "k8s_diagnose_service"
+    K8S_SERVICE_CONNECTIVITY = "k8s_service_connectivity"
     K8S_DIAGNOSE_DEPLOYMENT = "k8s_diagnose_deployment"
     K8S_DEPLOYMENTS = "k8s_deployments"
     K8S_SERVICES = "k8s_services"
@@ -988,6 +989,164 @@ def _is_local_k8s_context(context: str) -> bool:
     )
 
 
+
+def _k8s_service_connectivity_probe_command(
+    scoped: str,
+    service: str,
+    requested_port: int | None,
+) -> str:
+    """Build a bounded non-mutating TCP probe through kubectl port-forward."""
+
+    ports_jsonpath = (
+        '{range .spec.ports[*]}'
+        '{"PORT|"}{.port}{"|"}{.targetPort}{"|"}{.protocol}{"\\n"}{end}'
+    )
+    selector_template = (
+        '{{range $k, $v := .spec.selector}}'
+        '{{printf "%s=%s," $k $v}}{{end}}'
+    )
+    ready_jsonpath = (
+        '{range .items[*]}{range .endpoints[*]}'
+        '{.conditions.ready}{"\\n"}{end}{end}'
+    )
+
+    requested = "" if requested_port is None else str(requested_port)
+    endpoint_selector = f"kubernetes.io/service-name={service}"
+
+    lines = [
+        f"requested_port={_quote(requested)}",
+        (
+            f'ports="$({scoped} get service {_quote(service)} '
+            f'-o jsonpath={_quote(ports_jsonpath)})"'
+        ),
+        'selected=""',
+        'tcp_count=0',
+        'while IFS="|" read -r tag svc_port target_port proto; do',
+        '  [ "$tag" = "PORT" ] || continue',
+        '  [ "$proto" = "TCP" ] || continue',
+        '  tcp_count=$((tcp_count + 1))',
+        (
+            '  if [ -n "$requested_port" ] && '
+            '[ "$svc_port" = "$requested_port" ]; then '
+            'selected="$tag|$svc_port|$target_port|$proto"; fi'
+        ),
+        (
+            '  if [ -z "$requested_port" ] && '
+            '[ "$tcp_count" -eq 1 ]; then '
+            'selected="$tag|$svc_port|$target_port|$proto"; fi'
+        ),
+        'done <<< "$ports"',
+        (
+            'if [ -z "$requested_port" ] && [ "$tcp_count" -eq 0 ]; then '
+            'echo "CONNECTIVITY|SKIPPED|reason=no-tcp-service-port"; '
+            'exit 0; fi'
+        ),
+        (
+            'if [ -z "$requested_port" ] && [ "$tcp_count" -gt 1 ]; then '
+            'echo "CONNECTIVITY|SKIPPED|reason=multiple-tcp-service-ports'
+            '|count=$tcp_count"; exit 0; fi'
+        ),
+        (
+            'if [ -n "$requested_port" ] && [ -z "$selected" ]; then '
+            'echo "CONNECTIVITY|SKIPPED'
+            '|reason=requested-port-not-tcp-service-port'
+            '|requested_port=$requested_port"; exit 0; fi'
+        ),
+        'IFS="|" read -r _ service_port target_port protocol <<< "$selected"',
+        (
+            f'selector="$({scoped} get service {_quote(service)} '
+            f'-o go-template={_quote(selector_template)})"'
+        ),
+        'selector="${selector%,}"',
+        (
+            'if [ -z "$selector" ]; then '
+            'echo "CONNECTIVITY|SKIPPED|reason=no-service-selector'
+            '|service_port=$service_port|target_port=$target_port"; '
+            'exit 0; fi'
+        ),
+        (
+            f'ready_text="$({scoped} get endpointslices.discovery.k8s.io '
+            f'-l {_quote(endpoint_selector)} '
+            f'-o jsonpath={_quote(ready_jsonpath)})"'
+        ),
+        'ready_count=0',
+        'while IFS= read -r ready; do',
+        '  [ "$ready" = "true" ] && ready_count=$((ready_count + 1))',
+        'done <<< "$ready_text"',
+        (
+            'if [ "$ready_count" -eq 0 ]; then '
+            'echo "CONNECTIVITY|SKIPPED|reason=no-ready-endpoints'
+            '|service_port=$service_port|target_port=$target_port"; '
+            'exit 0; fi'
+        ),
+        'tmp="$(mktemp)"',
+        'pf_pid=""',
+        'cleanup() {',
+        '  if [ -n "$pf_pid" ]; then',
+        '    kill "$pf_pid" >/dev/null 2>&1 || true',
+        '    wait "$pf_pid" >/dev/null 2>&1 || true',
+        '  fi',
+        '  rm -f "$tmp"',
+        '}',
+        'trap cleanup EXIT',
+        (
+            f'{scoped} port-forward --address 127.0.0.1 '
+            f'{_quote("service/" + service)} ":$service_port" '
+            '>"$tmp" 2>&1 &'
+        ),
+        'pf_pid=$!',
+        'local_port=""',
+        'for _ in {1..30}; do',
+        '  while IFS= read -r line; do',
+        '    case "$line" in',
+        '      "Forwarding from 127.0.0.1:"*)',
+        '        candidate="${line#Forwarding from 127.0.0.1:}"',
+        '        candidate="${candidate%% *}"',
+        '        case "$candidate" in',
+        '          ""|*[!0-9]*) ;;',
+        '          *) local_port="$candidate" ;;',
+        '        esac',
+        '        ;;',
+        '    esac',
+        '  done < "$tmp"',
+        '  [ -n "$local_port" ] && break',
+        '  kill -0 "$pf_pid" >/dev/null 2>&1 || break',
+        '  sleep 0.1',
+        'done',
+        (
+            'if [ -z "$local_port" ]; then '
+            'echo "CONNECTIVITY|FAIL|reason=port-forward-start'
+            '|service_port=$service_port|target_port=$target_port"; '
+            'exit 0; fi'
+        ),
+        (
+            'if timeout 4 bash -c '
+            '"exec 3<>/dev/tcp/127.0.0.1/$local_port; '
+            'sleep 0.4; exec 3>&-; exec 3<&-" '
+            '>/dev/null 2>&1; then tcp_rc=0; else tcp_rc=$?; fi'
+        ),
+        'sleep 0.2',
+        (
+            'if grep -Eqi '
+            '"error forwarding port|connection refused|'
+            'failed to execute portforward" "$tmp"; then '
+            'echo "CONNECTIVITY|FAIL|reason=target-port-connect-failed'
+            '|service_port=$service_port|target_port=$target_port'
+            '|local_port=$local_port"; '
+            'elif [ "$tcp_rc" -ne 0 ]; then '
+            'echo "CONNECTIVITY|FAIL|reason=local-probe-failed'
+            '|service_port=$service_port|target_port=$target_port'
+            '|local_port=$local_port"; '
+            'else '
+            'echo "CONNECTIVITY|SUCCESS|reason=tcp-connected'
+            '|service_port=$service_port|target_port=$target_port'
+            '|local_port=$local_port"; fi'
+        ),
+    ]
+
+    return "bash -c " + _quote("\n".join(lines))
+
+
 def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
     workspace = workspace.resolve()
     plan = DevOpsPlan(
@@ -1747,12 +1906,21 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
                 ),
             ])
 
-        elif action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
+        elif action in {
+            DevOpsAction.K8S_DIAGNOSE_SERVICE,
+            DevOpsAction.K8S_SERVICE_CONNECTIVITY,
+        }:
             service = _safe_name(request.component, field_name="service")
             if not service:
                 raise ValueError(
                     "An explicit Kubernetes Service name is required for diagnosis."
                 )
+
+            requested_port = (
+                _validate_port(request.port)
+                if action == DevOpsAction.K8S_SERVICE_CONNECTIVITY
+                else None
+            )
 
             requested_context = _safe_context(request.context)
             if requested_context and requested_context.lower() in {
@@ -1868,6 +2036,32 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
                     stream_output=False,
                 ),
             ])
+
+            if action == DevOpsAction.K8S_SERVICE_CONNECTIVITY:
+                plan.steps.append(
+                    DevOpsStep(
+                        f"Probe Service-selected backend TCP connectivity for {service}",
+                        _k8s_service_connectivity_probe_command(
+                            scoped,
+                            service,
+                            requested_port,
+                        ),
+                        stream_output=False,
+                    )
+                )
+                plan.notes.extend([
+                    (
+                        "The connectivity probe uses a temporary local kubectl "
+                        "port-forward and automatically cleans up its local process "
+                        "and temporary output file."
+                    ),
+                    (
+                        "The probe does not create Pods or mutate cluster resources. "
+                        "It checks Service targetPort/backend listener reachability; "
+                        "kubectl port-forward bypasses the normal ClusterIP/kube-proxy "
+                        "dataplane."
+                    ),
+                ])
 
             plan.notes.extend([
                 (
@@ -3433,7 +3627,10 @@ def summarize_k8s_service_execution(
     plan: DevOpsPlan,
     step_results: list[DevOpsStepResult],
 ) -> list[str]:
-    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_SERVICE:
+    if plan.request.action not in {
+        DevOpsAction.K8S_DIAGNOSE_SERVICE,
+        DevOpsAction.K8S_SERVICE_CONNECTIVITY,
+    }:
         return []
 
     service_text = _k8s_step_text(step_results, "inspect service routing")
@@ -3486,7 +3683,10 @@ def reason_k8s_service_execution(
     plan: DevOpsPlan,
     step_results: list[DevOpsStepResult],
 ) -> tuple[list[str], list[str], list[str]]:
-    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_SERVICE:
+    if plan.request.action not in {
+        DevOpsAction.K8S_DIAGNOSE_SERVICE,
+        DevOpsAction.K8S_SERVICE_CONNECTIVITY,
+    }:
         return [], [], []
 
     service_text = _k8s_step_text(step_results, "inspect service routing")
@@ -3613,13 +3813,190 @@ def reason_k8s_service_execution(
         f"Service '{target}' has {len(ready_endpoints)} ready backend "
         "endpoint(s); the bounded evidence does not show a selector/no-endpoint fault."
     )
-    next_actions.append(
-        "If traffic is still failing, continue with Service-to-Pod connectivity "
-        "and targetPort/application-listener checks."
-    )
+    if plan.request.action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
+        next_actions.append(
+            "If traffic is still failing, continue with Service-to-Pod connectivity "
+            "and targetPort/application-listener checks."
+        )
 
     return diagnosis, evidence, next_actions
 
+
+
+
+def _parse_k8s_service_connectivity_probe(output: str) -> dict[str, str]:
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("CONNECTIVITY|"):
+            continue
+
+        parts = line.split("|")
+        result: dict[str, str] = {
+            "status": parts[1].strip().upper() if len(parts) > 1 else "",
+        }
+
+        for part in parts[2:]:
+            key, separator, value = part.partition("=")
+            if separator:
+                result[key.strip()] = value.strip()
+
+        return result
+
+    return {}
+
+
+def reason_k8s_service_connectivity_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> tuple[list[str], list[str], list[str]]:
+    if plan.request.action != DevOpsAction.K8S_SERVICE_CONNECTIVITY:
+        return [], [], []
+
+    probe_text = _k8s_step_text(
+        step_results,
+        "probe service-selected backend tcp connectivity",
+    )
+    probe = _parse_k8s_service_connectivity_probe(probe_text)
+
+    target = (
+        plan.inferred_component
+        or plan.request.component
+        or "service"
+    )
+
+    diagnosis: list[str] = []
+    evidence: list[str] = []
+    next_actions: list[str] = []
+
+    if not probe:
+        diagnosis.append(
+            f"Service '{target}' connectivity probe returned no structured result."
+        )
+        next_actions.append(
+            "Re-run the bounded connectivity diagnosis and inspect whether "
+            "kubectl port-forward is available for the selected Service."
+        )
+        return diagnosis, evidence, next_actions
+
+    status = probe.get("status", "")
+    reason = probe.get("reason", "")
+    service_port = probe.get("service_port", "")
+    target_port = probe.get("target_port", "")
+    local_port = probe.get("local_port", "")
+
+    mapping = ""
+    if service_port or target_port:
+        mapping = (
+            f"Service port {service_port or '?'} -> "
+            f"targetPort {target_port or '?'}"
+        )
+        evidence.append(mapping + ".")
+
+    if status == "SUCCESS":
+        diagnosis.append(
+            f"Service '{target}' selected backend accepted a bounded TCP "
+            "connection through the Service targetPort mapping; no "
+            "targetPort/application-listener failure is shown by this probe."
+        )
+        evidence.append(
+            "Temporary kubectl port-forward TCP probe succeeded"
+            + (f" via localhost:{local_port}" if local_port else "")
+            + "."
+        )
+        next_actions.append(
+            "If traffic still fails from workloads through the Service ClusterIP, "
+            "investigate cluster DNS, NetworkPolicy, and the Service dataplane. "
+            "The port-forward probe intentionally bypasses kube-proxy/ClusterIP routing."
+        )
+        return diagnosis, evidence, next_actions
+
+    if status == "FAIL":
+        if reason == "target-port-connect-failed":
+            diagnosis.append(
+                f"Service '{target}' has routing evidence, but the selected backend "
+                "did not accept the bounded TCP connection at the resolved targetPort. "
+                "A targetPort/application-listener mismatch is a strong candidate."
+            )
+            next_actions.append(
+                "Confirm the application's actual listening port against the Service "
+                "targetPort before changing the Service or restarting workloads."
+            )
+        elif reason == "port-forward-start":
+            diagnosis.append(
+                f"Service '{target}' backend probe could not establish the temporary "
+                "kubectl port-forward. This does not prove an application-listener fault."
+            )
+            next_actions.append(
+                "Check kubectl port-forward/RBAC access and whether an attachable "
+                "backend Pod is available, then repeat the connectivity check."
+            )
+        else:
+            diagnosis.append(
+                f"Service '{target}' bounded backend TCP probe failed "
+                f"({reason or 'unknown reason'})."
+            )
+            next_actions.append(
+                "Inspect the Service port mapping and backend listener before making "
+                "any routing changes."
+            )
+
+        evidence.append(
+            f"Connectivity probe status=FAIL, reason={reason or 'unknown'}."
+        )
+        return diagnosis, evidence, next_actions
+
+    if status == "SKIPPED":
+        evidence.append(
+            f"Connectivity probe skipped: {reason or 'unspecified reason'}."
+        )
+
+        if reason == "multiple-tcp-service-ports":
+            count = probe.get("count", "?")
+            diagnosis.append(
+                f"Service '{target}' exposes {count} TCP ports, so Iceman did not "
+                "guess which port to probe."
+            )
+            next_actions.append(
+                f"Specify the Service port explicitly, for example: "
+                f"check service {target} connectivity on port <service-port>"
+            )
+        elif reason == "requested-port-not-tcp-service-port":
+            requested = probe.get("requested_port", "?")
+            diagnosis.append(
+                f"Requested port {requested} is not a TCP Service port on "
+                f"Service '{target}'."
+            )
+            next_actions.append(
+                "Choose one of the Service's declared TCP ports and repeat the check."
+            )
+        elif reason == "no-tcp-service-port":
+            diagnosis.append(
+                f"Service '{target}' exposes no TCP Service port that this bounded "
+                "TCP probe can test."
+            )
+        elif reason == "no-service-selector":
+            diagnosis.append(
+                f"Service '{target}' has no selector, so Iceman did not attempt "
+                "a Service-selected Pod port-forward."
+            )
+        elif reason == "no-ready-endpoints":
+            next_actions.append(
+                "Resolve the selector/Pod-readiness/EndpointSlice issue before "
+                "testing backend listener connectivity."
+            )
+        else:
+            diagnosis.append(
+                f"Service '{target}' connectivity probe was skipped "
+                f"({reason or 'unspecified reason'})."
+            )
+
+        return diagnosis, evidence, next_actions
+
+    diagnosis.append(
+        f"Service '{target}' connectivity probe returned unknown status "
+        f"'{status or 'empty'}'."
+    )
+    return diagnosis, evidence, next_actions
 
 
 def _parse_k8s_deployment_status(output: str) -> dict[str, str]:
@@ -4136,12 +4513,27 @@ def execute_devops_plan(
             step_results,
         )
 
-    if plan.request.action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
+    if plan.request.action in {
+        DevOpsAction.K8S_DIAGNOSE_SERVICE,
+        DevOpsAction.K8S_SERVICE_CONNECTIVITY,
+    }:
         summary.extend(summarize_k8s_service_execution(plan, step_results))
         diagnosis, evidence, next_actions = reason_k8s_service_execution(
             plan,
             step_results,
         )
+        if plan.request.action == DevOpsAction.K8S_SERVICE_CONNECTIVITY:
+            (
+                connectivity_diagnosis,
+                connectivity_evidence,
+                connectivity_next_actions,
+            ) = reason_k8s_service_connectivity_execution(
+                plan,
+                step_results,
+            )
+            diagnosis.extend(connectivity_diagnosis)
+            evidence.extend(connectivity_evidence)
+            next_actions.extend(connectivity_next_actions)
 
     if plan.request.action == DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT:
         summary.extend(summarize_k8s_deployment_execution(plan, step_results))

@@ -138,6 +138,7 @@ HELP_TEXT = """
   show me the pods
   diagnose pod api-abc
   diagnose service backend
+  check service backend connectivity
   diagnose deployment backend
   show pods again
   show them again
