@@ -431,6 +431,26 @@ def _extract_devops_action_request(
                 devops_action=DevOpsAction.K8S_DIAGNOSE_POD,
                 component=match.group(1),
             )
+    service_diagnosis_patterns = (
+        r"^(?:diagnose|troubleshoot)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?service\s+([A-Za-z0-9_.-]+)$",
+        r"^(?:check\s+what(?:'s|\s+is)\s+wrong\s+with)\s+(?:the\s+)?service\s+([A-Za-z0-9_.-]+)$",
+        r"^why\s+(?:does|is)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?service\s+([A-Za-z0-9_.-]+)\s+(?:have\s+no\s+endpoints|not\s+working|failing|broken)$",
+        r"^why\s+does\s+service\s+([A-Za-z0-9_.-]+)\s+have\s+no\s+endpoints$",
+    )
+    for pattern in service_diagnosis_patterns:
+        match = re.match(pattern, lower)
+        if match:
+            return ReasoningDecision(
+                ReasoningAction.EXECUTE_DEVOPS_ACTION,
+                (
+                    "Run a bounded read-only Kubernetes Service diagnosis using "
+                    "selected Service routing fields, EndpointSlices, and matching "
+                    "Pod readiness."
+                ),
+                devops_action=DevOpsAction.K8S_DIAGNOSE_SERVICE,
+                component=match.group(1),
+            )
+
     if lower in {"show current kubernetes context", "show kubernetes context", "what kubernetes context am i using"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Show the current Kubernetes context.", devops_action=DevOpsAction.K8S_CONTEXT)
     if lower in {"show kubernetes contexts", "list kubernetes contexts", "show me kubernetes contexts"}:

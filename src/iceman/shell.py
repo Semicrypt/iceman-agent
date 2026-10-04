@@ -137,6 +137,7 @@ HELP_TEXT = """
   deploy backend to minikube
   show me the pods
   diagnose pod api-abc
+  diagnose service backend
   show pods again
   show them again
   scale backend to 5 replicas
@@ -191,7 +192,8 @@ def _legacy_docker_diagnose_target(raw: str) -> str | None:
     elif normalized.startswith("k8s "):
         normalized = normalized[len("k8s "):].strip()
 
-    if normalized == "pod" or normalized.startswith("pod "):
+    explicit_k8s_resource = normalized.split(maxsplit=1)[0] if normalized else ""
+    if explicit_k8s_resource in {"pod", "service"}:
         return None
 
     return target

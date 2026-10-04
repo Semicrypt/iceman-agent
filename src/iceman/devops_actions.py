@@ -37,6 +37,7 @@ class DevOpsAction(str, Enum):
     K8S_DEPLOY = "k8s_deploy"
     K8S_PODS = "k8s_pods"
     K8S_DIAGNOSE_POD = "k8s_diagnose_pod"
+    K8S_DIAGNOSE_SERVICE = "k8s_diagnose_service"
     K8S_DEPLOYMENTS = "k8s_deployments"
     K8S_SERVICES = "k8s_services"
     K8S_ROLLOUT = "k8s_rollout"
@@ -1744,6 +1745,148 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
                 ),
             ])
 
+        elif action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
+            service = _safe_name(request.component, field_name="service")
+            if not service:
+                raise ValueError(
+                    "An explicit Kubernetes Service name is required for diagnosis."
+                )
+
+            requested_context = _safe_context(request.context)
+            if requested_context and requested_context.lower() in {
+                "kubernetes",
+                "k8s",
+                "cluster",
+            }:
+                requested_context = None
+
+            current_context = _current_k8s_context(workspace)
+            contexts = _available_k8s_contexts(workspace)
+
+            if requested_context:
+                target_context = requested_context
+            else:
+                target_context = current_context
+                plan.context_inferred = True
+
+            if not target_context:
+                raise ValueError(
+                    "No active Kubernetes context is available for Service diagnosis."
+                )
+
+            if target_context not in contexts:
+                raise ValueError(
+                    f"Kubernetes context '{target_context}' was not found. "
+                    f"Available contexts: {', '.join(contexts)}."
+                )
+
+            namespace = _context_namespace(workspace, target_context) or "default"
+            namespace = _safe_name(namespace, field_name="namespace") or "default"
+
+            plan.inferred_component = service
+            plan.target_context = target_context
+            plan.target_namespace = namespace
+
+            scoped = (
+                f"kubectl --context {_quote(target_context)} "
+                f"--namespace {_quote(namespace)}"
+            )
+
+            service_jsonpath = (
+                '{"SERVICE|"}{.metadata.name}{"|"}{.spec.type}{"|"}'
+                '{.spec.clusterIP}{"|"}{.spec.selector}{"\\n"}'
+                '{range .spec.ports[*]}'
+                '{"PORT|"}{.name}{"|"}{.port}{"|"}'
+                '{.targetPort}{"|"}{.protocol}{"\\n"}{end}'
+            )
+
+            endpoints_jsonpath = (
+                '{range .items[*]}'
+                '{"SLICE|"}{.metadata.name}{"\\n"}'
+                '{range .endpoints[*]}'
+                '{"ENDPOINT|"}{.addresses[0]}{"|"}'
+                '{.conditions.ready}{"|"}'
+                '{.conditions.serving}{"|"}'
+                '{.conditions.terminating}{"\\n"}'
+                '{end}{end}'
+            )
+
+            pod_jsonpath = (
+                '{range .items[*]}'
+                '{"POD|"}{.metadata.name}{"|"}{.status.phase}{"|"}'
+                '{range .status.conditions[?(@.type=="Ready")]}'
+                '{.status}{end}{"\\n"}{end}'
+            )
+
+            selector_template = (
+                '{{range $k, $v := .spec.selector}}'
+                '{{printf "%s=%s," $k $v}}{{end}}'
+            )
+
+            selector_command = (
+                f"{scoped} get service {_quote(service)} "
+                f"-o go-template={_quote(selector_template)}"
+            )
+
+            matching_pods_script = (
+                f'selector="$({selector_command})"; '
+                'selector="${selector%,}"; '
+                'printf "SELECTOR|%s\\n" "$selector"; '
+                'if [ -z "$selector" ]; then '
+                'printf "ICEMAN_MATCHING_PODS|selector-empty\\n"; '
+                'exit 0; '
+                'fi; '
+                f'{scoped} get pods -l "$selector" '
+                f'-o jsonpath={_quote(pod_jsonpath)}'
+            )
+
+            endpoint_selector = f"kubernetes.io/service-name={service}"
+
+            plan.steps.extend([
+                DevOpsStep(
+                    f"Confirm service {service} exists",
+                    f"{scoped} get service {_quote(service)} -o name",
+                ),
+                DevOpsStep(
+                    f"Inspect service routing for {service}",
+                    f"{scoped} get service {_quote(service)} "
+                    f"-o jsonpath={_quote(service_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect EndpointSlices for {service}",
+                    f"{scoped} get endpointslices.discovery.k8s.io "
+                    f"-l {_quote(endpoint_selector)} "
+                    f"-o jsonpath={_quote(endpoints_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect pods matching service selector for {service}",
+                    "sh -c " + _quote(matching_pods_script),
+                    stream_output=False,
+                ),
+            ])
+
+            plan.notes.extend([
+                (
+                    f"Service diagnosis is read-only and explicitly scoped to "
+                    f"context '{target_context}', namespace '{namespace}'."
+                ),
+                (
+                    "Iceman reads only selected Service routing fields, "
+                    "EndpointSlice readiness metadata, and matching Pod readiness."
+                ),
+                (
+                    "The Service selector is converted to a label selector and "
+                    "passed as a quoted kubectl argument; it is never evaluated "
+                    "as shell syntax."
+                ),
+                (
+                    "Phase 2 Service diagnosis never patches selectors, restarts "
+                    "pods, changes Services, scales workloads, or deletes resources."
+                ),
+            ])
+
         elif action == DevOpsAction.K8S_DEPLOYMENTS:
             plan.steps.append(DevOpsStep("Show Kubernetes deployments", "kubectl get deployments"))
 
@@ -2953,6 +3096,299 @@ def summarize_terraform_plan(output: str) -> list[str]:
     return []
 
 
+
+def _parse_k8s_service_status(
+    output: str,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    service: dict[str, str] = {}
+    ports: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("SERVICE|"):
+            parts = line.split("|", 4)
+            while len(parts) < 5:
+                parts.append("")
+            _, name, service_type, cluster_ip, selector = parts
+            service = {
+                "name": name.strip(),
+                "type": service_type.strip(),
+                "cluster_ip": cluster_ip.strip(),
+                "selector_raw": selector.strip(),
+            }
+            continue
+
+        if line.startswith("PORT|"):
+            parts = line.split("|", 4)
+            while len(parts) < 5:
+                parts.append("")
+            _, name, port, target_port, protocol = parts
+            ports.append({
+                "name": name.strip(),
+                "port": port.strip(),
+                "target_port": target_port.strip(),
+                "protocol": protocol.strip(),
+            })
+
+    return service, ports
+
+
+def _parse_k8s_service_endpoints(
+    output: str,
+) -> tuple[list[str], list[dict[str, str]]]:
+    slices: list[str] = []
+    endpoints: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("SLICE|"):
+            _, _, name = line.partition("|")
+            if name.strip():
+                slices.append(name.strip())
+            continue
+
+        if line.startswith("ENDPOINT|"):
+            parts = line.split("|", 4)
+            while len(parts) < 5:
+                parts.append("")
+            _, address, ready, serving, terminating = parts
+            endpoints.append({
+                "address": address.strip(),
+                "ready": ready.strip(),
+                "serving": serving.strip(),
+                "terminating": terminating.strip(),
+            })
+
+    return slices, endpoints
+
+
+def _parse_k8s_service_matching_pods(
+    output: str,
+) -> tuple[str, list[dict[str, str]]]:
+    selector = ""
+    pods: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("SELECTOR|"):
+            selector = line.partition("|")[2].strip()
+            continue
+
+        if line.startswith("POD|"):
+            parts = line.split("|", 3)
+            while len(parts) < 4:
+                parts.append("")
+            _, name, phase, ready = parts
+            pods.append({
+                "name": name.strip(),
+                "phase": phase.strip(),
+                "ready": ready.strip(),
+            })
+
+    return selector, pods
+
+
+def summarize_k8s_service_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> list[str]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_SERVICE:
+        return []
+
+    service_text = _k8s_step_text(step_results, "inspect service routing")
+    endpoints_text = _k8s_step_text(step_results, "inspect endpointslices")
+    pods_text = _k8s_step_text(
+        step_results,
+        "inspect pods matching service selector",
+    )
+
+    service, _ = _parse_k8s_service_status(service_text)
+    _, endpoints = _parse_k8s_service_endpoints(endpoints_text)
+    selector, pods = _parse_k8s_service_matching_pods(pods_text)
+
+    target = (
+        service.get("name")
+        or plan.inferred_component
+        or plan.request.component
+        or "service"
+    )
+    service_type = service.get("type") or "unknown"
+
+    ready_pods = sum(
+        1 for pod in pods
+        if (pod.get("ready") or "").lower() == "true"
+    )
+    ready_endpoints = sum(
+        1 for endpoint in endpoints
+        if (endpoint.get("ready") or "").lower() == "true"
+    )
+
+    summary = [
+        (
+            f"Kubernetes service {target}: type={service_type}, "
+            f"selector={selector or 'none'}, "
+            f"matching_pods={len(pods)}, ready_matching_pods={ready_pods}, "
+            f"endpoints={len(endpoints)}, ready_endpoints={ready_endpoints}."
+        )
+    ]
+
+    if plan.target_context:
+        summary.append(
+            f"Kubernetes target: context={plan.target_context}, "
+            f"namespace={plan.target_namespace or 'default'}."
+        )
+
+    return summary
+
+
+def reason_k8s_service_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> tuple[list[str], list[str], list[str]]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_SERVICE:
+        return [], [], []
+
+    service_text = _k8s_step_text(step_results, "inspect service routing")
+    endpoints_text = _k8s_step_text(step_results, "inspect endpointslices")
+    pods_text = _k8s_step_text(
+        step_results,
+        "inspect pods matching service selector",
+    )
+
+    service, ports = _parse_k8s_service_status(service_text)
+    slices, endpoints = _parse_k8s_service_endpoints(endpoints_text)
+    selector, pods = _parse_k8s_service_matching_pods(pods_text)
+
+    target = (
+        service.get("name")
+        or plan.inferred_component
+        or plan.request.component
+        or "service"
+    )
+    service_type = service.get("type") or "unknown"
+    cluster_ip = service.get("cluster_ip") or "unknown"
+
+    ready_pods = [
+        pod for pod in pods
+        if (pod.get("ready") or "").lower() == "true"
+    ]
+    ready_endpoints = [
+        endpoint for endpoint in endpoints
+        if (endpoint.get("ready") or "").lower() == "true"
+    ]
+
+    diagnosis: list[str] = []
+    evidence: list[str] = []
+    next_actions: list[str] = []
+
+    evidence.append(
+        f"Service {target}: type={service_type}, clusterIP={cluster_ip}."
+    )
+
+    if ports:
+        rendered_ports = ", ".join(
+            (
+                f"{port.get('port') or '?'}"
+                f"->{port.get('target_port') or '?'}"
+                f"/{port.get('protocol') or 'TCP'}"
+            )
+            for port in ports
+        )
+        evidence.append(f"Service ports: {rendered_ports}.")
+
+    evidence.append(
+        f"EndpointSlices={len(slices)}, endpoints={len(endpoints)}, "
+        f"ready_endpoints={len(ready_endpoints)}."
+    )
+
+    if not selector:
+        if service_type.lower() == "externalname":
+            diagnosis.append(
+                f"Service '{target}' is ExternalName and does not select Pods."
+            )
+            next_actions.append(
+                "Verify the ExternalName target and DNS resolution rather than "
+                "looking for Pod selector endpoints."
+            )
+        else:
+            diagnosis.append(
+                f"Service '{target}' has no Pod selector, so Iceman cannot "
+                "associate it with backend Pods through label selection."
+            )
+            next_actions.append(
+                "Confirm whether the Service intentionally uses manually managed "
+                "EndpointSlices/endpoints or whether a selector is missing."
+            )
+        return diagnosis, evidence, next_actions
+
+    evidence.append(f"Service selector: {selector}.")
+    evidence.append(
+        f"Selector matched {len(pods)} Pod(s); "
+        f"{len(ready_pods)} are Ready."
+    )
+
+    if not pods:
+        diagnosis.append(
+            f"Service '{target}' selector '{selector}' matches no Pods "
+            "in the target namespace."
+        )
+        if not endpoints:
+            diagnosis.append(
+                f"Service '{target}' currently has no EndpointSlice backends."
+            )
+        next_actions.append(
+            "Compare the Service selector with the intended workload Pod labels. "
+            "Do not patch either side until the intended label contract is confirmed."
+        )
+        return diagnosis, evidence, next_actions
+
+    if not ready_pods:
+        diagnosis.append(
+            f"Service '{target}' selector matches {len(pods)} Pod(s), "
+            "but none of the matching Pods are Ready."
+        )
+        if not ready_endpoints:
+            diagnosis.append(
+                f"Service '{target}' has no ready backend endpoints."
+            )
+        next_actions.append(
+            "Diagnose the matching Pods' readiness, startup state, and readiness "
+            "probes before changing the Service selector."
+        )
+        return diagnosis, evidence, next_actions
+
+    if not ready_endpoints:
+        diagnosis.append(
+            f"Service '{target}' has Ready matching Pods but no ready "
+            "EndpointSlice endpoints are currently published."
+        )
+        next_actions.append(
+            "Re-check EndpointSlice publication and the matching Pods' readiness "
+            "state before changing Service routing."
+        )
+        return diagnosis, evidence, next_actions
+
+    diagnosis.append(
+        f"Service '{target}' has {len(ready_endpoints)} ready backend "
+        "endpoint(s); the bounded evidence does not show a selector/no-endpoint fault."
+    )
+    next_actions.append(
+        "If traffic is still failing, continue with Service-to-Pod connectivity "
+        "and targetPort/application-listener checks."
+    )
+
+    return diagnosis, evidence, next_actions
+
+
 def execute_devops_plan(
     plan: DevOpsPlan,
     step_runner: Callable[[DevOpsStep, int, int], CommandResult] | None = None,
@@ -3043,6 +3479,13 @@ def execute_devops_plan(
     if plan.request.action == DevOpsAction.K8S_DIAGNOSE_POD:
         summary.extend(summarize_k8s_pod_execution(plan, step_results))
         diagnosis, evidence, next_actions = reason_k8s_pod_execution(
+            plan,
+            step_results,
+        )
+
+    if plan.request.action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
+        summary.extend(summarize_k8s_service_execution(plan, step_results))
+        diagnosis, evidence, next_actions = reason_k8s_service_execution(
             plan,
             step_results,
         )
