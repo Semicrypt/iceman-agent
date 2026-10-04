@@ -471,6 +471,26 @@ def _extract_devops_action_request(
         )
     if re.match(r"^(?:show(?:\s+me)?(?:\s+the)?|list|show\s+kubernetes)\s+pods?$", lower):
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "List Kubernetes pods.", devops_action=DevOpsAction.K8S_PODS)
+    deployment_diagnosis_patterns = (
+        r"^(?:diagnose|troubleshoot)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?deployment\s+([A-Za-z0-9_.-]+)$",
+        r"^(?:check\s+what(?:'s|\s+is)\s+wrong\s+with)\s+(?:the\s+)?deployment\s+([A-Za-z0-9_.-]+)$",
+        r"^why\s+is\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?deployment\s+([A-Za-z0-9_.-]+)\s+(?:failing|stuck|not\s+ready|not\s+progressing|unavailable)$",
+        r"^why\s+is\s+([A-Za-z0-9_.-]+)\s+deployment\s+(?:failing|stuck|not\s+ready|not\s+progressing|unavailable)$",
+    )
+    for pattern in deployment_diagnosis_patterns:
+        match = re.match(pattern, lower)
+        if match:
+            return ReasoningDecision(
+                ReasoningAction.EXECUTE_DEVOPS_ACTION,
+                (
+                    "Run a bounded read-only Kubernetes Deployment diagnosis "
+                    "using replica state, rollout conditions, ReplicaSets, "
+                    "matching Pods, and recent events."
+                ),
+                devops_action=DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT,
+                component=match.group(1),
+            )
+
     if re.match(r"^(?:show(?:\s+me)?(?:\s+the)?|list|show\s+kubernetes)\s+deployments?$", lower):
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "List Kubernetes deployments.", devops_action=DevOpsAction.K8S_DEPLOYMENTS)
     if re.match(r"^(?:show(?:\s+me)?(?:\s+the)?|list|show\s+kubernetes)\s+services?$", lower):

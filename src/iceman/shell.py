@@ -138,6 +138,7 @@ HELP_TEXT = """
   show me the pods
   diagnose pod api-abc
   diagnose service backend
+  diagnose deployment backend
   show pods again
   show them again
   scale backend to 5 replicas
@@ -193,7 +194,7 @@ def _legacy_docker_diagnose_target(raw: str) -> str | None:
         normalized = normalized[len("k8s "):].strip()
 
     explicit_k8s_resource = normalized.split(maxsplit=1)[0] if normalized else ""
-    if explicit_k8s_resource in {"pod", "service"}:
+    if explicit_k8s_resource in {"pod", "service", "deployment"}:
         return None
 
     return target

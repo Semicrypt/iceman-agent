@@ -61,7 +61,7 @@ Available trusted actions:
   docker_security, docker_optimize, docker_rebuild_restart, docker_guided_repair,
   docker_compose_status.
   Kubernetes actions: k8s_context, k8s_contexts, k8s_validate, k8s_deploy,
-  k8s_pods, k8s_diagnose_pod, k8s_diagnose_service, k8s_deployments, k8s_services, k8s_rollout,
+  k8s_pods, k8s_diagnose_pod, k8s_diagnose_service, k8s_diagnose_deployment, k8s_deployments, k8s_services, k8s_rollout,
   k8s_scale, k8s_logs, k8s_describe, k8s_restart.
   Terraform actions: terraform_init, terraform_fmt, terraform_validate,
   terraform_plan, terraform_explain_plan, terraform_state.
@@ -120,6 +120,10 @@ Rules:
    Do not guess that a Pod, Deployment, Docker container, or ambiguous component
    name is a Service. Service diagnosis is read-only and must not be converted
    into selector patches, restarts, scaling, or resource deletion.
+15. Use k8s_diagnose_deployment only for an explicitly named Kubernetes Deployment.
+   Do not guess that a Pod, Service, Docker container, or ambiguous component name
+   is a Deployment. Deployment diagnosis is read-only and must not be converted
+   into rollout, restart, scale, patch, delete, or recreate commands.
 13. Use execute_devops_action for ordinary natural-language operational work.
    Examples: "build the backend", "run it on port 5050", "show me the pods",
    "deploy backend to minikube", "scale backend to 5 replicas", "validate my

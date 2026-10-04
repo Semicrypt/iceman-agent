@@ -38,6 +38,7 @@ class DevOpsAction(str, Enum):
     K8S_PODS = "k8s_pods"
     K8S_DIAGNOSE_POD = "k8s_diagnose_pod"
     K8S_DIAGNOSE_SERVICE = "k8s_diagnose_service"
+    K8S_DIAGNOSE_DEPLOYMENT = "k8s_diagnose_deployment"
     K8S_DEPLOYMENTS = "k8s_deployments"
     K8S_SERVICES = "k8s_services"
     K8S_ROLLOUT = "k8s_rollout"
@@ -1887,6 +1888,207 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
                 ),
             ])
 
+        elif action == DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT:
+            deployment = _safe_name(request.component, field_name="deployment")
+            if not deployment:
+                raise ValueError(
+                    "An explicit Kubernetes Deployment name is required for diagnosis."
+                )
+
+            requested_context = _safe_context(request.context)
+            if requested_context and requested_context.lower() in {
+                "kubernetes",
+                "k8s",
+                "cluster",
+            }:
+                requested_context = None
+
+            current_context = _current_k8s_context(workspace)
+            contexts = _available_k8s_contexts(workspace)
+
+            if requested_context:
+                target_context = requested_context
+            else:
+                target_context = current_context
+                plan.context_inferred = True
+
+            if not target_context:
+                raise ValueError(
+                    "No active Kubernetes context is available for Deployment diagnosis."
+                )
+
+            if target_context not in contexts:
+                raise ValueError(
+                    f"Kubernetes context '{target_context}' was not found. "
+                    f"Available contexts: {', '.join(contexts)}."
+                )
+
+            namespace = _context_namespace(workspace, target_context) or "default"
+            namespace = _safe_name(namespace, field_name="namespace") or "default"
+
+            plan.inferred_component = deployment
+            plan.target_context = target_context
+            plan.target_namespace = namespace
+
+            scoped = (
+                f"kubectl --context {_quote(target_context)} "
+                f"--namespace {_quote(namespace)}"
+            )
+
+            status_jsonpath = (
+                '{"DEPLOYMENT|"}{.metadata.name}{"|"}'
+                '{.metadata.generation}{"|"}'
+                '{.status.observedGeneration}{"|"}'
+                '{.spec.replicas}{"|"}'
+                '{.status.replicas}{"|"}'
+                '{.status.updatedReplicas}{"|"}'
+                '{.status.readyReplicas}{"|"}'
+                '{.status.availableReplicas}{"|"}'
+                '{.status.unavailableReplicas}{"\\n"}'
+            )
+
+            conditions_jsonpath = (
+                '{range .status.conditions[*]}'
+                '{"CONDITION|"}{.type}{"|"}{.status}{"|"}'
+                '{.reason}{"|"}{.message}{"\\n"}{end}'
+            )
+
+            selector_template = (
+                '{{range $k, $v := .spec.selector.matchLabels}}'
+                '{{printf "%s=%s," $k $v}}{{end}}'
+                '{{range .spec.selector.matchExpressions}}'
+                '{{if eq .operator "In"}}'
+                '{{printf "%s in (" .key}}'
+                '{{range $i, $v := .values}}'
+                '{{if $i}}{{printf ","}}{{end}}{{printf "%s" $v}}{{end}}'
+                '{{printf "),"}}'
+                '{{else if eq .operator "NotIn"}}'
+                '{{printf "%s notin (" .key}}'
+                '{{range $i, $v := .values}}'
+                '{{if $i}}{{printf ","}}{{end}}{{printf "%s" $v}}{{end}}'
+                '{{printf "),"}}'
+                '{{else if eq .operator "Exists"}}'
+                '{{printf "%s," .key}}'
+                '{{else if eq .operator "DoesNotExist"}}'
+                '{{printf "!%s," .key}}'
+                '{{end}}'
+                '{{end}}'
+            )
+
+            selector_command = (
+                f"{scoped} get deployment {_quote(deployment)} "
+                f"-o go-template={_quote(selector_template)}"
+            )
+
+            rs_jsonpath = (
+                '{range .items[*]}'
+                '{"RS|"}{.metadata.name}{"|"}'
+                '{.spec.replicas}{"|"}'
+                '{.status.replicas}{"|"}'
+                '{.status.readyReplicas}{"|"}'
+                '{.status.availableReplicas}{"|"}'
+                '{range .metadata.ownerReferences[*]}'
+                '{.kind}{":"}{.name}{end}{"\\n"}'
+                '{end}'
+            )
+
+            pod_jsonpath = (
+                '{range .items[*]}'
+                '{"POD|"}{.metadata.name}{"|"}'
+                '{.status.phase}{"|"}'
+                '{range .status.conditions[?(@.type=="Ready")]}'
+                '{.status}{end}{"|"}'
+                '{range .status.containerStatuses[*]}'
+                '{.state.waiting.reason}{","}{end}{"|"}'
+                '{range .status.containerStatuses[*]}'
+                '{.restartCount}{","}{end}{"\\n"}'
+                '{end}'
+            )
+
+            rs_script = (
+                f'selector="$({selector_command})"; '
+                'selector="${selector%,}"; '
+                'printf "SELECTOR|%s\\n" "$selector"; '
+                'if [ -z "$selector" ]; then exit 0; fi; '
+                f'{scoped} get replicasets -l "$selector" '
+                f'-o jsonpath={_quote(rs_jsonpath)}'
+            )
+
+            pods_script = (
+                f'selector="$({selector_command})"; '
+                'selector="${selector%,}"; '
+                'printf "SELECTOR|%s\\n" "$selector"; '
+                'if [ -z "$selector" ]; then exit 0; fi; '
+                f'{scoped} get pods -l "$selector" '
+                f'-o jsonpath={_quote(pod_jsonpath)}'
+            )
+
+            event_selector = (
+                f"involvedObject.kind=Deployment,"
+                f"involvedObject.name={deployment}"
+            )
+
+            events_command = (
+                f"{scoped} get events "
+                f"--field-selector {_quote(event_selector)} "
+                "--sort-by=.lastTimestamp "
+                "-o custom-columns=TYPE:.type,REASON:.reason,MESSAGE:.message "
+                "--no-headers"
+            )
+
+            plan.steps.extend([
+                DevOpsStep(
+                    f"Confirm deployment {deployment} exists",
+                    f"{scoped} get deployment {_quote(deployment)} -o name",
+                ),
+                DevOpsStep(
+                    f"Inspect deployment status for {deployment}",
+                    f"{scoped} get deployment {_quote(deployment)} "
+                    f"-o jsonpath={_quote(status_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect deployment conditions for {deployment}",
+                    f"{scoped} get deployment {_quote(deployment)} "
+                    f"-o jsonpath={_quote(conditions_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect ReplicaSets for deployment {deployment}",
+                    "sh -c " + _quote(rs_script),
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect pods for deployment {deployment}",
+                    "sh -c " + _quote(pods_script),
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Read recent deployment events for {deployment}",
+                    "sh -c " + _quote(events_command + " | tail -n 20"),
+                    stream_output=False,
+                ),
+            ])
+
+            plan.notes.extend([
+                (
+                    f"Deployment diagnosis is read-only and explicitly scoped to "
+                    f"context '{target_context}', namespace '{namespace}'."
+                ),
+                (
+                    "Iceman inspects selected Deployment status/condition fields, "
+                    "matching ReplicaSets, matching Pod readiness, and recent events."
+                ),
+                (
+                    "The Deployment selector is converted to a quoted kubectl label "
+                    "selector and is never evaluated as shell syntax."
+                ),
+                (
+                    "Phase 2 Deployment diagnosis never rolls out, restarts, scales, "
+                    "patches, deletes, or recreates Kubernetes resources."
+                ),
+            ])
+
         elif action == DevOpsAction.K8S_DEPLOYMENTS:
             plan.steps.append(DevOpsStep("Show Kubernetes deployments", "kubectl get deployments"))
 
@@ -3389,6 +3591,427 @@ def reason_k8s_service_execution(
     return diagnosis, evidence, next_actions
 
 
+
+def _parse_k8s_deployment_status(output: str) -> dict[str, str]:
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("DEPLOYMENT|"):
+            continue
+
+        parts = line.split("|", 9)
+        while len(parts) < 10:
+            parts.append("")
+
+        (
+            _,
+            name,
+            generation,
+            observed_generation,
+            desired,
+            replicas,
+            updated,
+            ready,
+            available,
+            unavailable,
+        ) = parts
+
+        return {
+            "name": name.strip(),
+            "generation": generation.strip(),
+            "observed_generation": observed_generation.strip(),
+            "desired": desired.strip(),
+            "replicas": replicas.strip(),
+            "updated": updated.strip(),
+            "ready": ready.strip(),
+            "available": available.strip(),
+            "unavailable": unavailable.strip(),
+        }
+
+    return {}
+
+
+def _parse_k8s_deployment_conditions(
+    output: str,
+) -> list[dict[str, str]]:
+    conditions: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("CONDITION|"):
+            continue
+
+        parts = line.split("|", 4)
+        while len(parts) < 5:
+            parts.append("")
+
+        _, condition_type, status, reason, message = parts
+
+        conditions.append({
+            "type": condition_type.strip(),
+            "status": status.strip(),
+            "reason": reason.strip(),
+            "message": message.strip(),
+        })
+
+    return conditions
+
+
+def _parse_k8s_deployment_replicasets(
+    output: str,
+) -> tuple[str, list[dict[str, str]]]:
+    selector = ""
+    replicasets: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("SELECTOR|"):
+            selector = line.partition("|")[2].strip()
+            continue
+
+        if not line.startswith("RS|"):
+            continue
+
+        parts = line.split("|", 6)
+        while len(parts) < 7:
+            parts.append("")
+
+        _, name, desired, replicas, ready, available, owner = parts
+        replicasets.append({
+            "name": name.strip(),
+            "desired": desired.strip(),
+            "replicas": replicas.strip(),
+            "ready": ready.strip(),
+            "available": available.strip(),
+            "owner": owner.strip(),
+        })
+
+    return selector, replicasets
+
+
+def _parse_k8s_deployment_pods(
+    output: str,
+) -> tuple[str, list[dict[str, str]]]:
+    selector = ""
+    pods: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("SELECTOR|"):
+            selector = line.partition("|")[2].strip()
+            continue
+
+        if not line.startswith("POD|"):
+            continue
+
+        parts = line.split("|", 5)
+        while len(parts) < 6:
+            parts.append("")
+
+        _, name, phase, ready, waiting, restarts = parts
+        pods.append({
+            "name": name.strip(),
+            "phase": phase.strip(),
+            "ready": ready.strip(),
+            "waiting": waiting.strip().strip(","),
+            "restarts": restarts.strip().strip(","),
+        })
+
+    return selector, pods
+
+
+def _k8s_int(value: str | None) -> int:
+    try:
+        return int(value or "0")
+    except (TypeError, ValueError):
+        return 0
+
+
+def summarize_k8s_deployment_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> list[str]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT:
+        return []
+
+    status = _parse_k8s_deployment_status(
+        _k8s_step_text(step_results, "inspect deployment status")
+    )
+
+    target = (
+        status.get("name")
+        or plan.inferred_component
+        or plan.request.component
+        or "deployment"
+    )
+
+    summary = [
+        (
+            f"Kubernetes deployment {target}: "
+            f"desired={_k8s_int(status.get('desired'))}, "
+            f"current={_k8s_int(status.get('replicas'))}, "
+            f"updated={_k8s_int(status.get('updated'))}, "
+            f"ready={_k8s_int(status.get('ready'))}, "
+            f"available={_k8s_int(status.get('available'))}, "
+            f"unavailable={_k8s_int(status.get('unavailable'))}."
+        )
+    ]
+
+    if plan.target_context:
+        summary.append(
+            f"Kubernetes target: context={plan.target_context}, "
+            f"namespace={plan.target_namespace or 'default'}."
+        )
+
+    return summary
+
+
+def reason_k8s_deployment_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> tuple[list[str], list[str], list[str]]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT:
+        return [], [], []
+
+    status = _parse_k8s_deployment_status(
+        _k8s_step_text(step_results, "inspect deployment status")
+    )
+    conditions = _parse_k8s_deployment_conditions(
+        _k8s_step_text(step_results, "inspect deployment conditions")
+    )
+    selector, replicasets = _parse_k8s_deployment_replicasets(
+        _k8s_step_text(step_results, "inspect replicasets for deployment")
+    )
+    _, pods = _parse_k8s_deployment_pods(
+        _k8s_step_text(step_results, "inspect pods for deployment")
+    )
+    events_text = _k8s_step_text(
+        step_results,
+        "recent deployment events",
+    )
+
+    target = (
+        status.get("name")
+        or plan.inferred_component
+        or plan.request.component
+        or "deployment"
+    )
+
+    generation = _k8s_int(status.get("generation"))
+    observed = _k8s_int(status.get("observed_generation"))
+    desired = _k8s_int(status.get("desired"))
+    current = _k8s_int(status.get("replicas"))
+    updated = _k8s_int(status.get("updated"))
+    ready = _k8s_int(status.get("ready"))
+    available = _k8s_int(status.get("available"))
+    unavailable = _k8s_int(status.get("unavailable"))
+
+    owned_rs = [
+        rs for rs in replicasets
+        if rs.get("owner") == f"Deployment:{target}"
+    ]
+
+    ready_pods = [
+        pod for pod in pods
+        if (pod.get("ready") or "").lower() == "true"
+    ]
+
+    waiting_reasons: list[str] = []
+    for pod in pods:
+        for reason in (pod.get("waiting") or "").split(","):
+            reason = reason.strip()
+            if reason and reason not in waiting_reasons:
+                waiting_reasons.append(reason)
+
+    diagnosis: list[str] = []
+    evidence: list[str] = []
+    next_actions: list[str] = []
+    fault_detected = False
+
+    evidence.append(
+        (
+            f"Deployment {target}: generation={generation}, "
+            f"observedGeneration={observed}, desired={desired}, "
+            f"current={current}, updated={updated}, ready={ready}, "
+            f"available={available}, unavailable={unavailable}."
+        )
+    )
+
+    if selector:
+        evidence.append(f"Deployment selector: {selector}.")
+
+    evidence.append(
+        f"Matching Pods={len(pods)}; Ready matching Pods={len(ready_pods)}."
+    )
+    evidence.append(
+        f"Owned ReplicaSets={len(owned_rs)}; selector-matching ReplicaSets={len(replicasets)}."
+    )
+
+    progress_deadline = next(
+        (
+            c for c in conditions
+            if c.get("type") == "Progressing"
+            and c.get("status") == "False"
+            and c.get("reason") == "ProgressDeadlineExceeded"
+        ),
+        None,
+    )
+
+    replica_failure = next(
+        (
+            c for c in conditions
+            if c.get("type") == "ReplicaFailure"
+            and c.get("status") == "True"
+        ),
+        None,
+    )
+
+    if progress_deadline:
+        fault_detected = True
+        diagnosis.append(
+            f"Deployment '{target}' exceeded its rollout progress deadline."
+        )
+        evidence.append(
+            "Progressing=False, reason=ProgressDeadlineExceeded."
+        )
+
+    if replica_failure:
+        fault_detected = True
+        reason = replica_failure.get("reason") or "unknown"
+        diagnosis.append(
+            f"Deployment '{target}' reports a replica creation failure "
+            f"(reason={reason})."
+        )
+        evidence.append(
+            f"ReplicaFailure=True, reason={reason}."
+        )
+
+    if generation > 0 and observed < generation:
+        fault_detected = True
+        diagnosis.append(
+            f"Deployment '{target}' controller has not yet observed the latest "
+            f"generation ({observed} < {generation})."
+        )
+
+    if desired == 0:
+        if not fault_detected:
+            diagnosis.append(
+                f"Deployment '{target}' is intentionally scaled to zero replicas; "
+                "zero Pod availability is not treated as a failure."
+            )
+        next_actions.append(
+            "No availability remediation is required unless zero replicas were unintended."
+        )
+        return diagnosis, evidence, next_actions
+
+    if updated < desired:
+        fault_detected = True
+        diagnosis.append(
+            f"Deployment '{target}' rollout is incomplete: "
+            f"{updated}/{desired} desired replicas are updated."
+        )
+
+    if ready < desired or available < desired or unavailable > 0:
+        fault_detected = True
+        diagnosis.append(
+            f"Deployment '{target}' is not fully available: "
+            f"ready={ready}/{desired}, available={available}/{desired}, "
+            f"unavailable={unavailable}."
+        )
+
+    if desired > 0 and not pods:
+        fault_detected = True
+        diagnosis.append(
+            f"Deployment '{target}' currently has no Pods matching its selector."
+        )
+
+    if waiting_reasons:
+        fault_detected = True
+        diagnosis.append(
+            "Matching Pods report container waiting reason(s): "
+            + ", ".join(waiting_reasons)
+            + "."
+        )
+        evidence.append(
+            "Pod waiting reasons: " + ", ".join(waiting_reasons) + "."
+        )
+
+    high_signal_events: list[str] = []
+    for raw_line in events_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        parts = line.split(None, 2)
+        reason = parts[1].lower() if len(parts) >= 2 else ""
+
+        if any(
+            token in reason
+            for token in (
+                "failed",
+                "error",
+                "backoff",
+                "deadline",
+                "quota",
+                "forbidden",
+            )
+        ):
+            high_signal_events.append(line)
+
+    if high_signal_events:
+        evidence.append(
+            "Recent deployment event: " + high_signal_events[-1]
+        )
+
+    for condition in conditions:
+        ctype = condition.get("type") or "unknown"
+        cstatus = condition.get("status") or "unknown"
+        creason = condition.get("reason") or "unknown"
+        evidence.append(
+            f"Condition {ctype}={cstatus}, reason={creason}."
+        )
+
+    if fault_detected:
+        next_actions.append(
+            "Inspect the Deployment conditions, owned ReplicaSets, and failing "
+            "matching Pods before restarting, scaling, or changing the rollout."
+        )
+
+        failing_pods = [
+            pod.get("name")
+            for pod in pods
+            if (
+                (pod.get("ready") or "").lower() != "true"
+                or pod.get("waiting")
+            )
+            and pod.get("name")
+        ]
+
+        if failing_pods:
+            next_actions.append(
+                f"Run bounded Pod diagnosis on '{failing_pods[0]}' to inspect "
+                "its status, events, and current/previous logs."
+            )
+
+        return diagnosis, evidence, next_actions
+
+    diagnosis.append(
+        f"Deployment '{target}' is fully available and the bounded evidence "
+        "does not show a rollout or replica-availability fault."
+    )
+    next_actions.append(
+        "If application traffic is still failing, continue with Service and "
+        "Service-to-Pod connectivity diagnosis."
+    )
+
+    return diagnosis, evidence, next_actions
+
+
 def execute_devops_plan(
     plan: DevOpsPlan,
     step_runner: Callable[[DevOpsStep, int, int], CommandResult] | None = None,
@@ -3486,6 +4109,13 @@ def execute_devops_plan(
     if plan.request.action == DevOpsAction.K8S_DIAGNOSE_SERVICE:
         summary.extend(summarize_k8s_service_execution(plan, step_results))
         diagnosis, evidence, next_actions = reason_k8s_service_execution(
+            plan,
+            step_results,
+        )
+
+    if plan.request.action == DevOpsAction.K8S_DIAGNOSE_DEPLOYMENT:
+        summary.extend(summarize_k8s_deployment_execution(plan, step_results))
+        diagnosis, evidence, next_actions = reason_k8s_deployment_execution(
             plan,
             step_results,
         )
