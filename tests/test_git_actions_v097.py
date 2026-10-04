@@ -68,6 +68,60 @@ class GitActionsV097Tests(unittest.TestCase):
         self.assertFalse(plan.safe_to_execute)
         self.assertTrue(any("origin" in note for note in plan.notes))
 
+    def test_push_tag_requires_origin(self):
+        root = self._repo()
+        (root / "README.md").write_text("hello", encoding="utf-8")
+        git(root, "add", "README.md")
+        git(root, "commit", "-m", "initial")
+        git(root, "tag", "-a", "v0.9.7", "-m", "v0.9.7")
+
+        plan = build_git_plan(
+            root,
+            GitRequest(action=GitAction.PUSH_TAG, tag="v0.9.7"),
+        )
+
+        self.assertFalse(plan.safe_to_execute)
+        self.assertTrue(any("origin" in note for note in plan.notes))
+
+    def test_push_tag_builds_bounded_single_tag_plan(self):
+        root = self._repo()
+        (root / "README.md").write_text("hello", encoding="utf-8")
+        git(root, "add", "README.md")
+        git(root, "commit", "-m", "initial")
+        git(root, "tag", "-a", "v0.9.7", "-m", "v0.9.7")
+        git(root, "remote", "add", "origin", "git@github.com:test/iceman-agent.git")
+
+        plan = build_git_plan(
+            root,
+            GitRequest(action=GitAction.PUSH_TAG, tag="v0.9.7"),
+        )
+
+        self.assertTrue(plan.safe_to_execute)
+        commands = [step.command for step in plan.steps]
+        self.assertIn("git push origin v0.9.7", commands)
+        self.assertTrue(
+            any(
+                "git ls-remote --exit-code --tags origin refs/tags/v0.9.7" == command
+                for command in commands
+            )
+        )
+        self.assertFalse(any("--force" in command for command in commands))
+
+    def test_tag_refuses_to_replace_existing_tag(self):
+        root = self._repo()
+        (root / "README.md").write_text("hello", encoding="utf-8")
+        git(root, "add", "README.md")
+        git(root, "commit", "-m", "initial")
+        git(root, "tag", "-a", "v0.9.7", "-m", "v0.9.7")
+
+        plan = build_git_plan(
+            root,
+            GitRequest(action=GitAction.TAG, tag="v0.9.7"),
+        )
+
+        self.assertFalse(plan.safe_to_execute)
+        self.assertTrue(any("already exists" in note for note in plan.notes))
+
     def test_github_create_repo_defaults_private_and_does_not_push(self):
         root = self._repo()
         ok = CommandResult(command="gh auth status", returncode=0, stdout="ok", stderr="")

@@ -23,6 +23,7 @@ class GitAction(str, Enum):
     REMOTES = "git_remotes"
     BRANCH = "git_branch"
     TAG = "git_tag"
+    PUSH_TAG = "git_push_tag"
     GITHUB_CREATE_REPO = "github_create_repo"
 
 
@@ -289,6 +290,10 @@ def build_git_plan(workspace: Path, request: GitRequest) -> GitPlan:
                 plan.notes.append("Generated/heavy directories are not ignored: " + ", ".join(heavy[:8]))
                 plan.notes.append("Create or update .gitignore before staging the whole project.")
             if plan.safe_to_execute:
+                plan.notes.append(
+                    f"Pre-commit safety scan passed for {len(changed)} changed path(s): "
+                    "no sensitive files, no files at or above 100 MiB, and no unignored generated/heavy paths detected."
+                )
                 plan.steps.extend([
                     GitStep("Check whitespace errors", "git diff --check"),
                     GitStep("Stage all approved changes", "git add -A", True),
@@ -302,16 +307,22 @@ def build_git_plan(workspace: Path, request: GitRequest) -> GitPlan:
             staged = _staged_paths(workspace)
             if not staged:
                 raise ValueError("There are no staged changes to commit. Stage the intended files first.")
-            sensitive, large, _ = _scan_paths(workspace, staged)
+            sensitive, large, heavy = _scan_paths(workspace, staged)
             plan.sensitive_paths = sensitive
             plan.large_paths = large
-            if sensitive or large:
+            if sensitive or large or heavy:
                 plan.safe_to_execute = False
                 if sensitive:
                     plan.notes.append("Potential sensitive staged files detected: " + ", ".join(sensitive[:8]))
                 if large:
                     plan.notes.append("Oversized staged files detected: " + ", ".join(large[:8]))
+                if heavy:
+                    plan.notes.append("Generated/heavy staged paths detected: " + ", ".join(heavy[:8]))
             if plan.safe_to_execute:
+                plan.notes.append(
+                    f"Pre-commit safety scan passed for {len(staged)} staged path(s): "
+                    "no sensitive, oversized, or generated/heavy files detected."
+                )
                 plan.steps.extend([
                     GitStep("Check staged whitespace errors", "git diff --cached --check"),
                     GitStep("Show staged summary", "git diff --cached --stat"),
@@ -403,9 +414,65 @@ def build_git_plan(workspace: Path, request: GitRequest) -> GitPlan:
             tag = (request.tag or "").strip()
             if not tag or not _SAFE_TAG.fullmatch(tag):
                 raise ValueError("Provide a safe Git tag such as v0.9.7.")
+
+            local_ref = f"refs/tags/{tag}"
+            existing = _run(
+                workspace,
+                f"git show-ref --verify --quiet {_quote(local_ref)}",
+            )
+            if existing and existing.returncode == 0:
+                raise ValueError(
+                    f"Tag '{tag}' already exists locally. "
+                    "Iceman will not move or replace an existing milestone tag automatically."
+                )
+
             plan.steps.extend([
                 GitStep("Create annotated milestone tag", f"git tag -a {_quote(tag)} -m {_quote(tag)}", True),
                 GitStep("Show milestone tag", f"git show --no-patch --oneline {_quote(tag)}"),
+            ])
+
+        elif action == GitAction.PUSH_TAG:
+            if not repo:
+                raise ValueError("This workspace is not a Git repository yet.")
+
+            tag = (request.tag or "").strip()
+            if not tag or not _SAFE_TAG.fullmatch(tag):
+                raise ValueError("Provide a safe existing Git tag such as v0.9.7.")
+
+            remotes = _remote_names(workspace)
+            if "origin" not in remotes:
+                raise ValueError(
+                    "No 'origin' remote is configured. "
+                    "Create/connect the GitHub repository before publishing a tag."
+                )
+
+            local_ref = f"refs/tags/{tag}"
+            existing = _run(
+                workspace,
+                f"git show-ref --verify --quiet {_quote(local_ref)}",
+            )
+            if not existing or existing.returncode != 0:
+                raise ValueError(
+                    f"Local tag '{tag}' does not exist. "
+                    "Create the milestone tag before publishing it."
+                )
+
+            plan.remote = "origin"
+            plan.steps.extend([
+                GitStep(
+                    f"Verify local milestone tag {tag}",
+                    f"git show-ref --verify --quiet {_quote(local_ref)}",
+                ),
+                GitStep("Show configured origin", "git remote -v"),
+                GitStep(
+                    f"Push milestone tag {tag} to origin",
+                    f"git push origin {_quote(tag)}",
+                    True,
+                ),
+                GitStep(
+                    f"Verify milestone tag {tag} on origin",
+                    f"git ls-remote --exit-code --tags origin {_quote(local_ref)}",
+                ),
             ])
 
         else:
@@ -477,6 +544,8 @@ def execute_git_plan(
         summary.append("Changes were staged, committed, and pushed successfully.")
     elif plan.request.action == GitAction.TAG:
         summary.append(f"Milestone tag created: {plan.request.tag}")
+    elif plan.request.action == GitAction.PUSH_TAG:
+        summary.append(f"Milestone tag published to origin: {plan.request.tag}")
 
     return GitExecutionResult(
         plan=plan,

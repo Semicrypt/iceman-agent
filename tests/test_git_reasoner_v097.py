@@ -48,6 +48,21 @@ class GitReasonerV097Tests(unittest.TestCase):
         self.assertIn("commit", decision.interpreted_request)
         self.assertIn("changes", decision.interpreted_request)
 
+    def test_push_named_tag_to_github(self):
+        decision = reason_request("push tag v0.9.7 to github", self.state)
+        self.assertEqual(decision.git_action, GitAction.PUSH_TAG)
+        self.assertEqual(decision.tag, "v0.9.7")
+
+    def test_push_the_named_tag(self):
+        decision = reason_request("push the v0.9.7 tag", self.state)
+        self.assertEqual(decision.git_action, GitAction.PUSH_TAG)
+        self.assertEqual(decision.tag, "v0.9.7")
+
+    def test_publish_named_tag(self):
+        decision = reason_request("publish tag v0.9.7", self.state)
+        self.assertEqual(decision.git_action, GitAction.PUSH_TAG)
+        self.assertEqual(decision.tag, "v0.9.7")
+
     def test_tag(self):
         decision = reason_request("tag this as v0.9.7", self.state)
         self.assertEqual(decision.git_action, GitAction.TAG)

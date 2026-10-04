@@ -63,7 +63,7 @@ Available trusted actions:
   Terraform actions: terraform_init, terraform_fmt, terraform_validate,
   terraform_plan, terraform_explain_plan, terraform_state.
 - execute_git_action: run one trusted natural-language Git/GitHub action. Set git_action and only structured commit_message, repo_name, visibility, or tag fields when explicitly supplied. Never encode shell syntax.
-  Git actions: git_status, git_diff, git_init, git_stage_all, git_commit, git_push, git_commit_push, git_remotes, git_branch, git_tag, github_create_repo.
+  Git actions: git_status, git_diff, git_init, git_stage_all, git_commit, git_push, git_commit_push, git_remotes, git_branch, git_tag, git_push_tag, github_create_repo.
 - execute_linux_action: run one trusted natural-language Linux action. Set
   linux_action and only the structured path/destination/pattern/port parameters
   explicitly supplied or clearly referenced by the user. Never encode shell syntax.
@@ -119,7 +119,7 @@ Rules:
    creation/movement inside the active workspace, permission inspection, chmod +x,
    disk/process/port inspection, and bounded find/search requests. Never synthesize
    a shell command. Prefer clarification over guessing paths.
-16. Terraform apply/destroy and Kubernetes delete are not exposed in v0.9.7.
+16. Terraform apply/destroy and Kubernetes delete are not exposed as trusted actions.
    For requests to apply/destroy infrastructure or delete cluster resources,
    choose fallback rather than attempting to encode a command.
 16. If the user asks to delete/destroy/terminate arbitrary infrastructure, use
@@ -154,7 +154,7 @@ class OpenAIReasoningProvider:
             except ImportError as exc:
                 raise RuntimeError(
                     "OpenAI provider requires the 'openai' Python package. "
-                    "Reinstall Iceman v0.6 dependencies with: pip install -e ."
+                    "Reinstall Iceman dependencies with: pip install -e ."
                 ) from exc
             client = OpenAI()
         self.client = client

@@ -379,6 +379,20 @@ def _extract_devops_action_request(
     match = re.match(r"^(?:commit and push|stage commit and push|commit and push everything)(?:\s+(?:with\s+)?message\s+)(?:[\"'])(.+?)(?:[\"'])$", normalized, flags=re.IGNORECASE)
     if match:
         return ReasoningDecision(ReasoningAction.EXECUTE_GIT_ACTION, "Safely stage, commit, and push the current milestone.", git_action=GitAction.COMMIT_PUSH, commit_message=match.group(1).strip())
+    push_tag_patterns = (
+        r"^(?:push|publish|send)\s+(?:the\s+)?tag\s+([A-Za-z0-9][A-Za-z0-9._/+\-]{0,127})(?:\s+to\s+(?:github|origin))?$",
+        r"^(?:push|publish|send)\s+(?:the\s+)?([A-Za-z0-9][A-Za-z0-9._/+\-]{0,127})\s+tag(?:\s+to\s+(?:github|origin))?$",
+    )
+    for pattern in push_tag_patterns:
+        match = re.match(pattern, lower)
+        if match:
+            return ReasoningDecision(
+                ReasoningAction.EXECUTE_GIT_ACTION,
+                "Publish one existing local Git milestone tag to the configured origin remote.",
+                git_action=GitAction.PUSH_TAG,
+                tag=match.group(1),
+            )
+
     if lower in {"push to github", "push this project to github", "push this branch", "push everything", "git push", "push to origin"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_GIT_ACTION, "Push the current Git branch to the configured origin remote.", git_action=GitAction.PUSH)
 
