@@ -136,6 +136,7 @@ HELP_TEXT = """
   validate my kubernetes manifests
   deploy backend to minikube
   show me the pods
+  diagnose pod api-abc
   show pods again
   show them again
   scale backend to 5 replicas
@@ -167,6 +168,33 @@ Provider configuration:
   ICEMAN_OPENAI_MODEL=gpt-5.6-luna
   OPENAI_API_KEY=<your key>
 """
+
+
+def _legacy_docker_diagnose_target(raw: str) -> str | None:
+    """Return a legacy Docker diagnose target unless the request names a K8s pod."""
+    stripped = raw.strip()
+    parts = stripped.split(maxsplit=1)
+
+    if len(parts) != 2 or parts[0].lower() != "diagnose":
+        return None
+
+    target = parts[1].strip()
+    normalized = " ".join(target.lower().split())
+
+    # Explicit Kubernetes pod language must fall through to Advanced
+    # Intelligence instead of being consumed by the legacy Docker handler.
+    if normalized.startswith("the "):
+        normalized = normalized[4:].strip()
+
+    if normalized.startswith("kubernetes "):
+        normalized = normalized[len("kubernetes "):].strip()
+    elif normalized.startswith("k8s "):
+        normalized = normalized[len("k8s "):].strip()
+
+    if normalized == "pod" or normalized.startswith("pod "):
+        return None
+
+    return target
 
 
 def _run_diagnosis(
@@ -936,12 +964,12 @@ def start_shell(project_path: Path | None = None) -> None:
             )
             continue
 
-        if lowered.startswith("diagnose "):
-            target = raw[len("diagnose "):].strip()
-            if not target:
+        legacy_diagnose_target = _legacy_docker_diagnose_target(raw)
+        if legacy_diagnose_target is not None:
+            if not legacy_diagnose_target:
                 console.print("[yellow]Usage: diagnose <container>[/yellow]")
                 continue
-            _run_diagnosis(target, state)
+            _run_diagnosis(legacy_diagnose_target, state)
             continue
 
         investigate_option_match = __import__("re").match(

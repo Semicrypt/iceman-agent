@@ -413,6 +413,24 @@ def _extract_devops_action_request(
         return ReasoningDecision(ReasoningAction.EXECUTE_GIT_ACTION, "Create an annotated local Git milestone tag.", git_action=GitAction.TAG, tag=match.group(1))
 
     # Kubernetes is checked before generic restart/logs.
+    pod_diagnosis_patterns = (
+        r"^(?:diagnose|troubleshoot)\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?pod\s+([A-Za-z0-9_.-]+)$",
+        r"^(?:check\s+what(?:'s|\s+is)\s+wrong\s+with)\s+(?:the\s+)?pod\s+([A-Za-z0-9_.-]+)$",
+        r"^why\s+is\s+(?:the\s+)?(?:kubernetes\s+|k8s\s+)?pod\s+([A-Za-z0-9_.-]+)\s+(?:crashing|failing|pending|restarting|stuck|not\s+running)$",
+        r"^why\s+is\s+([A-Za-z0-9_.-]+)\s+pod\s+(?:crashing|failing|pending|restarting|stuck|not\s+running)$",
+    )
+    for pattern in pod_diagnosis_patterns:
+        match = re.match(pattern, lower)
+        if match:
+            return ReasoningDecision(
+                ReasoningAction.EXECUTE_DEVOPS_ACTION,
+                (
+                    "Run a bounded read-only Kubernetes pod diagnosis using selected "
+                    "status, conditions, recent events, and current/previous logs."
+                ),
+                devops_action=DevOpsAction.K8S_DIAGNOSE_POD,
+                component=match.group(1),
+            )
     if lower in {"show current kubernetes context", "show kubernetes context", "what kubernetes context am i using"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Show the current Kubernetes context.", devops_action=DevOpsAction.K8S_CONTEXT)
     if lower in {"show kubernetes contexts", "list kubernetes contexts", "show me kubernetes contexts"}:

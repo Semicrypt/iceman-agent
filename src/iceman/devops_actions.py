@@ -36,6 +36,7 @@ class DevOpsAction(str, Enum):
     K8S_VALIDATE = "k8s_validate"
     K8S_DEPLOY = "k8s_deploy"
     K8S_PODS = "k8s_pods"
+    K8S_DIAGNOSE_POD = "k8s_diagnose_pod"
     K8S_DEPLOYMENTS = "k8s_deployments"
     K8S_SERVICES = "k8s_services"
     K8S_ROLLOUT = "k8s_rollout"
@@ -1580,6 +1581,169 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
         elif action == DevOpsAction.K8S_PODS:
             plan.steps.append(DevOpsStep("Show Kubernetes pods", "kubectl get pods -o wide"))
 
+        elif action == DevOpsAction.K8S_DIAGNOSE_POD:
+            pod = _safe_name(component, field_name="pod")
+            if not pod:
+                raise ValueError("A pod name is required for Kubernetes pod diagnosis.")
+
+            requested_context = _safe_context(request.context)
+            current = _current_k8s_context(workspace)
+            contexts = _available_k8s_contexts(workspace)
+
+            if requested_context and requested_context.lower() in {
+                "kubernetes",
+                "k8s",
+                "cluster",
+            }:
+                requested_context = None
+
+            if not contexts:
+                raise ValueError(
+                    "Iceman could not enumerate kubeconfig contexts. Confirm "
+                    "kubectl is installed and kubeconfig is readable."
+                )
+
+            if requested_context is None:
+                if not current:
+                    raise ValueError(
+                        "No Kubernetes context was specified and kubectl has no "
+                        "active context."
+                    )
+                if current not in contexts:
+                    raise ValueError(
+                        f"The active Kubernetes context '{current}' is not present "
+                        "in the kubeconfig context inventory."
+                    )
+                target_context = current
+                plan.context_inferred = True
+            else:
+                target_context = requested_context
+                if target_context not in contexts:
+                    raise ValueError(
+                        f"Kubernetes context '{target_context}' was not found. "
+                        f"Available contexts: {', '.join(contexts)}."
+                    )
+
+            namespace = _context_namespace(workspace, target_context) or "default"
+            namespace = _safe_name(namespace, field_name="namespace") or "default"
+
+            plan.inferred_component = pod
+            plan.target_context = target_context
+            plan.target_namespace = namespace
+
+            scoped = (
+                f"kubectl --context {_quote(target_context)} "
+                f"--namespace {_quote(namespace)}"
+            )
+
+            status_jsonpath = (
+                '{"POD|"}{.metadata.name}{"|"}{.status.phase}{"|"}'
+                '{.status.reason}{"\\n"}'
+                '{range .status.initContainerStatuses[*]}'
+                '{"INIT|"}{.name}{"|"}{.ready}{"|"}{.restartCount}{"|"}'
+                '{.state.waiting.reason}{"|"}'
+                '{.state.terminated.reason}{"|"}'
+                '{.state.terminated.exitCode}{"|"}'
+                '{.lastState.terminated.reason}{"|"}'
+                '{.lastState.terminated.exitCode}{"\\n"}{end}'
+                '{range .status.containerStatuses[*]}'
+                '{"CONTAINER|"}{.name}{"|"}{.ready}{"|"}{.restartCount}{"|"}'
+                '{.state.waiting.reason}{"|"}'
+                '{.state.terminated.reason}{"|"}'
+                '{.state.terminated.exitCode}{"|"}'
+                '{.lastState.terminated.reason}{"|"}'
+                '{.lastState.terminated.exitCode}{"\\n"}{end}'
+            )
+
+            conditions_jsonpath = (
+                '{range .status.conditions[*]}'
+                '{"CONDITION|"}{.type}{"|"}{.status}{"|"}'
+                '{.reason}{"|"}{.message}{"\\n"}{end}'
+            )
+
+            event_selector = (
+                f"involvedObject.kind=Pod,involvedObject.name={pod}"
+            )
+
+            current_logs = (
+                f"{scoped} logs {_quote('pod/' + pod)} "
+                "--all-containers=true --prefix=true --tail=100"
+            )
+            previous_logs = (
+                f"{scoped} logs {_quote('pod/' + pod)} "
+                "--all-containers=true --prefix=true --previous --tail=100"
+            )
+
+            current_log_script = (
+                f"{current_logs} 2>&1; rc=$?; "
+                'printf "\\nICEMAN_LOGS_RC=%s\\n" "$rc"; exit 0'
+            )
+            previous_log_script = (
+                f"{previous_logs} 2>&1; rc=$?; "
+                'printf "\\nICEMAN_LOGS_RC=%s\\n" "$rc"; exit 0'
+            )
+
+            events_command = (
+                f"{scoped} get events "
+                f"--field-selector {_quote(event_selector)} "
+                "--sort-by=.lastTimestamp "
+                "-o custom-columns=TYPE:.type,REASON:.reason,MESSAGE:.message "
+                "--no-headers"
+            )
+
+            plan.steps.extend([
+                DevOpsStep(
+                    f"Confirm pod {pod} exists",
+                    f"{scoped} get pod {_quote(pod)} -o name",
+                ),
+                DevOpsStep(
+                    f"Inspect pod status for {pod}",
+                    f"{scoped} get pod {_quote(pod)} "
+                    f"-o jsonpath={_quote(status_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Inspect pod conditions for {pod}",
+                    f"{scoped} get pod {_quote(pod)} "
+                    f"-o jsonpath={_quote(conditions_jsonpath)}",
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Read recent pod events for {pod}",
+                    "sh -c " + _quote(events_command + " | tail -n 20"),
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Read bounded current logs for {pod}",
+                    "sh -c " + _quote(current_log_script),
+                    stream_output=False,
+                ),
+                DevOpsStep(
+                    f"Read bounded previous logs for {pod}",
+                    "sh -c " + _quote(previous_log_script),
+                    stream_output=False,
+                ),
+            ])
+
+            plan.notes.extend([
+                (
+                    f"Pod diagnosis is read-only and explicitly scoped to context "
+                    f"'{target_context}', namespace '{namespace}'."
+                ),
+                (
+                    "Iceman inspects selected status fields rather than the full pod "
+                    "spec so literal environment values are not unnecessarily exposed."
+                ),
+                (
+                    "Current and previous logs are bounded to 100 lines per kubectl "
+                    "request; unavailable logs do not abort the diagnosis."
+                ),
+                (
+                    "Phase 1 diagnosis never deletes, restarts, patches, scales, "
+                    "or recreates Kubernetes resources."
+                ),
+            ])
+
         elif action == DevOpsAction.K8S_DEPLOYMENTS:
             plan.steps.append(DevOpsStep("Show Kubernetes deployments", "kubectl get deployments"))
 
@@ -2440,6 +2604,340 @@ def reason_docker_execution(
     next_actions = list(dict.fromkeys(next_actions))[:4]
     return diagnosis, evidence, next_actions
 
+def _k8s_step_text(
+    step_results: list[DevOpsStepResult],
+    label_fragment: str,
+) -> str:
+    fragment = label_fragment.lower()
+    result = next(
+        (
+            item.result
+            for item in step_results
+            if fragment in item.step.label.lower()
+        ),
+        None,
+    )
+    if result is None:
+        return ""
+    return ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+
+
+def _parse_k8s_pod_status(
+    output: str,
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    pod: dict[str, str] = {}
+    containers: list[dict[str, str]] = []
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("POD|"):
+            parts = line.split("|", 3)
+            while len(parts) < 4:
+                parts.append("")
+            _, name, phase, reason = parts
+            pod = {
+                "name": name.strip(),
+                "phase": phase.strip(),
+                "reason": reason.strip(),
+            }
+            continue
+
+        if line.startswith("CONTAINER|") or line.startswith("INIT|"):
+            parts = line.split("|", 8)
+            while len(parts) < 9:
+                parts.append("")
+
+            (
+                kind,
+                name,
+                ready,
+                restarts,
+                waiting_reason,
+                terminated_reason,
+                terminated_exit,
+                last_reason,
+                last_exit,
+            ) = parts
+
+            containers.append({
+                "kind": kind.strip(),
+                "name": name.strip(),
+                "ready": ready.strip(),
+                "restarts": restarts.strip(),
+                "waiting_reason": waiting_reason.strip(),
+                "terminated_reason": terminated_reason.strip(),
+                "terminated_exit": terminated_exit.strip(),
+                "last_reason": last_reason.strip(),
+                "last_exit": last_exit.strip(),
+            })
+
+    return pod, containers
+
+
+def _k8s_oom_termination(
+    container: dict[str, str],
+) -> tuple[str, str] | None:
+    """Return OOMKilled state as (current|previous, exit_code)."""
+    terminated = (container.get("terminated_reason") or "").lower()
+    last_reason = (container.get("last_reason") or "").lower()
+
+    if terminated == "oomkilled":
+        return (
+            "current",
+            container.get("terminated_exit") or "unknown",
+        )
+
+    if last_reason == "oomkilled":
+        return (
+            "previous",
+            container.get("last_exit") or "unknown",
+        )
+
+    return None
+
+
+def summarize_k8s_pod_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> list[str]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_POD:
+        return []
+
+    status_text = _k8s_step_text(step_results, "inspect pod status")
+    pod, containers = _parse_k8s_pod_status(status_text)
+
+    phase = pod.get("phase") or "unknown"
+    target = pod.get("name") or plan.inferred_component or plan.request.component or "pod"
+
+    total_restarts = 0
+    for container in containers:
+        try:
+            total_restarts += int(container.get("restarts") or "0")
+        except ValueError:
+            pass
+
+    summary = [
+        (
+            f"Kubernetes pod {target}: phase={phase}, "
+            f"containers={len(containers)}, total_restarts={total_restarts}."
+        )
+    ]
+
+    if plan.target_context:
+        summary.append(
+            f"Kubernetes target: context={plan.target_context}, "
+            f"namespace={plan.target_namespace or 'default'}."
+        )
+
+    return summary
+
+
+def reason_k8s_pod_execution(
+    plan: DevOpsPlan,
+    step_results: list[DevOpsStepResult],
+) -> tuple[list[str], list[str], list[str]]:
+    if plan.request.action != DevOpsAction.K8S_DIAGNOSE_POD:
+        return [], [], []
+
+    status_text = _k8s_step_text(step_results, "inspect pod status")
+    conditions_text = _k8s_step_text(step_results, "inspect pod conditions")
+    events_text = _k8s_step_text(step_results, "recent pod events")
+    current_logs = _k8s_step_text(step_results, "bounded current logs")
+    previous_logs = _k8s_step_text(step_results, "bounded previous logs")
+
+    pod, containers = _parse_k8s_pod_status(status_text)
+
+    target = (
+        pod.get("name")
+        or plan.inferred_component
+        or plan.request.component
+        or "pod"
+    )
+    phase = pod.get("phase") or "unknown"
+    pod_reason = pod.get("reason") or ""
+
+    diagnosis: list[str] = []
+    evidence: list[str] = []
+    next_actions: list[str] = []
+
+    evidence.append(f"Pod {target} phase={phase}.")
+    if pod_reason:
+        evidence.append(f"Pod-level reason: {pod_reason}.")
+
+    has_image_pull = False
+    has_crashloop = False
+    has_oom = False
+    total_restarts = 0
+
+    for container in containers:
+        name = container.get("name") or "container"
+        waiting = (container.get("waiting_reason") or "").lower()
+        terminated = (container.get("terminated_reason") or "").lower()
+        last_reason = (container.get("last_reason") or "").lower()
+        last_exit = container.get("last_exit") or ""
+        terminated_exit = container.get("terminated_exit") or ""
+
+        try:
+            restarts = int(container.get("restarts") or "0")
+        except ValueError:
+            restarts = 0
+        total_restarts += restarts
+
+        if waiting in {"imagepullbackoff", "errimagepull"}:
+            has_image_pull = True
+            diagnosis.append(
+                f"Container '{name}' cannot start because Kubernetes reports "
+                f"{container.get('waiting_reason')}."
+            )
+            evidence.append(
+                f"{name}: waiting={container.get('waiting_reason')}."
+            )
+
+        if waiting == "crashloopbackoff":
+            has_crashloop = True
+            diagnosis.append(
+                f"Container '{name}' is in CrashLoopBackOff after repeated failures."
+            )
+            evidence.append(
+                f"{name}: waiting=CrashLoopBackOff, restarts={restarts}."
+            )
+
+        oom_termination = _k8s_oom_termination(container)
+        if oom_termination is not None:
+            has_oom = True
+            termination_scope, exit_code = oom_termination
+            diagnosis.append(
+                f"Container '{name}' was terminated with OOMKilled "
+                f"(exit={exit_code})."
+            )
+            evidence.append(
+                f"{name}: {termination_scope} termination=OOMKilled, "
+                f"exit={exit_code}."
+            )
+
+        if restarts > 0 and not (
+            waiting == "crashloopbackoff"
+            or terminated == "oomkilled"
+            or last_reason == "oomkilled"
+        ):
+            reason = (
+                container.get("last_reason")
+                or container.get("terminated_reason")
+                or "unknown"
+            )
+            exit_code = (
+                container.get("last_exit")
+                or container.get("terminated_exit")
+                or "unknown"
+            )
+            evidence.append(
+                f"{name}: restarts={restarts}, previous_reason={reason}, "
+                f"previous_exit={exit_code}."
+            )
+
+    signal_text = (conditions_text + "\n" + events_text).lower()
+
+    if "liveness probe failed" in signal_text:
+        diagnosis.append(
+            f"{target} has recent liveness-probe failures."
+        )
+        evidence.append("Recent Kubernetes events report a liveness probe failure.")
+        next_actions.append(
+            "Verify the liveness probe path/port, startup timing, timeout, and "
+            "application responsiveness before changing restart behavior."
+        )
+
+    if "readiness probe failed" in signal_text:
+        diagnosis.append(
+            f"{target} has recent readiness-probe failures."
+        )
+        evidence.append("Recent Kubernetes events report a readiness probe failure.")
+        next_actions.append(
+            "Verify the readiness probe path/port and confirm the application "
+            "becomes ready only after its dependencies are available."
+        )
+
+    if phase.lower() == "pending" and not has_image_pull:
+        if "failedscheduling" in signal_text or "unschedulable" in signal_text:
+            diagnosis.append(
+                f"{target} is Pending because the scheduler could not place the pod."
+            )
+            evidence.append(
+                "Recent Kubernetes events contain FailedScheduling/Unschedulable."
+            )
+            next_actions.append(
+                "Review pod resource requests, node capacity, taints/tolerations, "
+                "node selectors/affinity, and any unbound PVCs."
+            )
+        else:
+            diagnosis.append(
+                f"{target} is Pending, but the bounded evidence does not yet "
+                "identify a specific scheduling or image-pull cause."
+            )
+
+    if has_image_pull:
+        next_actions.append(
+            "Verify the container image name/tag, registry reachability, and "
+            "imagePullSecrets before retrying the workload."
+        )
+
+    if has_oom:
+        next_actions.append(
+            "Review actual memory usage and configured memory requests/limits "
+            "before increasing limits or restarting repeatedly."
+        )
+
+    if has_crashloop:
+        next_actions.append(
+            "Review the bounded previous-container logs and the previous exit "
+            "reason before changing the workload or restarting it."
+        )
+
+    if total_restarts > 0 and not has_crashloop and not has_oom:
+        diagnosis.append(
+            f"{target} has restarted {total_restarts} time(s); inspect the previous "
+            "termination reason and bounded previous logs for the failure path."
+        )
+
+    if not diagnosis:
+        if phase.lower() == "running":
+            diagnosis.append(
+                f"{target} is Running and the bounded Kubernetes evidence did not "
+                "show CrashLoopBackOff, image-pull, OOM, scheduling, or probe failures."
+            )
+        elif phase.lower() == "failed":
+            diagnosis.append(
+                f"{target} is in Failed phase; inspect the recorded termination "
+                "reason and exit code."
+            )
+        else:
+            diagnosis.append(
+                f"No supported high-signal pod failure class was established for "
+                f"{target} from the bounded evidence."
+            )
+
+    current_match = re.search(r"ICEMAN_LOGS_RC=(\d+)", current_logs)
+    previous_match = re.search(r"ICEMAN_LOGS_RC=(\d+)", previous_logs)
+
+    if current_match:
+        evidence.append(
+            f"Bounded current-log probe exit={current_match.group(1)}."
+        )
+    if previous_match:
+        evidence.append(
+            f"Bounded previous-log probe exit={previous_match.group(1)}."
+        )
+
+    diagnosis = list(dict.fromkeys(diagnosis))[:5]
+    evidence = list(dict.fromkeys(evidence))[:8]
+    next_actions = list(dict.fromkeys(next_actions))[:5]
+
+    return diagnosis, evidence, next_actions
+
+
 def summarize_terraform_plan(output: str) -> list[str]:
     if "No changes." in output or "No changes. Your infrastructure matches" in output:
         return ["Terraform reports no infrastructure changes."]
@@ -2541,6 +3039,13 @@ def execute_devops_plan(
     if plan.request.action.value.startswith("docker_"):
         summary.extend(summarize_docker_execution(plan.request.action, step_results))
         diagnosis, evidence, next_actions = reason_docker_execution(plan, step_results)
+
+    if plan.request.action == DevOpsAction.K8S_DIAGNOSE_POD:
+        summary.extend(summarize_k8s_pod_execution(plan, step_results))
+        diagnosis, evidence, next_actions = reason_k8s_pod_execution(
+            plan,
+            step_results,
+        )
 
     if plan.request.action == DevOpsAction.DOCKER_BUILD and plan.inferred_image:
         summary.append(f"Docker image built: {plan.inferred_image}")
