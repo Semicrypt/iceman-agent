@@ -51,6 +51,7 @@ class LocalReasoningProvider:
                 port=decision.port,
                 replicas=decision.replicas,
                 image=decision.image,
+                startup_target=decision.startup_target,
                 devops_action=decision.devops_action,
                 context=decision.context,
                 terraform_dir=decision.terraform_dir,

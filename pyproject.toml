@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iceman-agent"
-version = "0.9.8"
+version = "0.9.9"
 description = "A safety-first Cloud and DevOps CLI agent with pluggable AI reasoning."
 readme = "README.md"
 requires-python = ">=3.10"

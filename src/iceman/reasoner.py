@@ -51,6 +51,7 @@ class ReasoningDecision:
     port: int | None = None
     replicas: int | None = None
     image: str | None = None
+    startup_target: str | None = None
     devops_action: DevOpsAction | None = None
     context: str | None = None
     terraform_dir: str | None = None
@@ -467,6 +468,42 @@ def _extract_devops_action_request(
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Create and summarize a read-only Terraform plan.", devops_action=DevOpsAction.TERRAFORM_EXPLAIN_PLAN)
     if lower in {"show terraform state", "list terraform state", "show terraform resources"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "List Terraform state resources.", devops_action=DevOpsAction.TERRAFORM_STATE)
+
+    # Evidence-backed guided Docker remediation.
+    match = re.match(
+        r"^(?:fix|repair)\s+(?:the\s+)?(?:container\s+)?"
+        r"([A-Za-z0-9_.-]+)"
+        r"(?:\s+(?:using|with)\s+([A-Za-z0-9][A-Za-z0-9._/\-]{0,127}))?$",
+        lower,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            (
+                "Build an evidence-backed Docker repair from the latest diagnosis "
+                "without inventing a replacement startup target."
+            ),
+            devops_action=DevOpsAction.DOCKER_GUIDED_REPAIR,
+            component=match.group(1),
+            startup_target=match.group(2),
+        )
+
+    match = re.match(
+        r"^(?:fix|repair)\s+it"
+        r"(?:\s+(?:using|with)\s+([A-Za-z0-9][A-Za-z0-9._/\-]{0,127}))?$",
+        lower,
+    )
+    if match and state.last_devops_component:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            (
+                "Build an evidence-backed Docker repair for the most recently "
+                "diagnosed component."
+            ),
+            devops_action=DevOpsAction.DOCKER_GUIDED_REPAIR,
+            component=state.last_devops_component,
+            startup_target=match.group(1),
+        )
 
     # Docker advanced diagnostics / intelligence. These are checked before
     # generic build/run/log actions so conversational "why" requests stay bounded.

@@ -52,11 +52,14 @@ Available trusted actions:
 - rollback_workspace_files: undo the latest successful Iceman workspace-file write.
 - execute_devops_action: run one trusted natural-language Docker, Kubernetes,
   or Terraform action. Set devops_action to one enum value. Reuse component,
-  image, port, replicas, context, and terraform_dir only as structured parameters.
-  Never encode a shell command in any field.
+  image, startup_target, port, replicas, context, and terraform_dir only as
+  structured parameters. startup_target may be set only when the user explicitly
+  supplies the replacement startup entry file. Never invent it and never encode
+  a shell command in any field.
   Docker actions: docker_build, docker_run, docker_list, docker_images, docker_logs, docker_stop,
   docker_restart, docker_diagnose, docker_health, docker_ports, docker_connectivity,
-  docker_security, docker_optimize, docker_rebuild_restart, docker_compose_status.
+  docker_security, docker_optimize, docker_rebuild_restart, docker_guided_repair,
+  docker_compose_status.
   Kubernetes actions: k8s_context, k8s_contexts, k8s_validate, k8s_deploy,
   k8s_pods, k8s_deployments, k8s_services, k8s_rollout, k8s_scale, k8s_logs,
   k8s_describe, k8s_restart.
@@ -91,9 +94,9 @@ Rules:
    of an HTTP execution-context mismatch or a request to investigate the
    numbered context-investigation option. This action must never be used to
    bypass WAF/bot protections or discover/spoof credentials.
-5. Use repair_last_diagnosis only for the older Docker/container remediation
-   workflow when the context is a container diagnosis rather than an
-   application-signal investigation.
+5. Prefer docker_guided_repair for the newer DevOps Docker diagnosis workflow.
+   Never invent a replacement startup target. Use repair_last_diagnosis only for
+   the older legacy Docker/container diagnosis workflow.
 6. Use diagnose_container for a specific Docker/container problem.
 7. Use assess_project for broad health/check-everything requests.
 8. Use explain_context for follow-up questions like "what caused that?" after

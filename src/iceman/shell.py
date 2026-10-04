@@ -547,6 +547,7 @@ def _run_devops_action(
     action: DevOpsAction | None,
     component: str | None,
     image: str | None,
+    startup_target: str | None,
     port: int | None,
     replicas: int | None,
     context: str | None,
@@ -560,16 +561,30 @@ def _run_devops_action(
         )
         return
 
+    if action == DevOpsAction.DOCKER_GUIDED_REPAIR and component is None:
+        component = state.last_devops_component
+
     request = DevOpsRequest(
         action=action,
         component=component,
         image=image,
+        startup_target=startup_target,
         port=port,
         replicas=replicas,
         context=context,
         terraform_dir=terraform_dir,
     )
-    plan = build_devops_plan(state.workspace, request)
+    if action == DevOpsAction.DOCKER_GUIDED_REPAIR:
+        from iceman.devops_actions import build_guided_docker_repair_plan
+
+        plan = build_guided_docker_repair_plan(
+            state.workspace,
+            request,
+            state.last_devops_result,
+        )
+    else:
+        plan = build_devops_plan(state.workspace, request)
+
     state.remember_devops_plan(plan)
     advisor = advise_devops_plan(plan)
     show_advisor_report(advisor)
@@ -662,6 +677,7 @@ def _dispatch_trusted_intent(
     port: int | None = None,
     replicas: int | None = None,
     image: str | None = None,
+    startup_target: str | None = None,
     devops_action: DevOpsAction | None = None,
     context: str | None = None,
     terraform_dir: str | None = None,
@@ -770,6 +786,7 @@ def _dispatch_trusted_intent(
             devops_action,
             component,
             image,
+            startup_target,
             port,
             replicas,
             context,
@@ -1090,6 +1107,7 @@ def start_shell(project_path: Path | None = None) -> None:
             port=intent.port,
             replicas=intent.replicas,
             image=intent.image,
+            startup_target=intent.startup_target,
             devops_action=intent.devops_action,
             context=intent.context,
             terraform_dir=intent.terraform_dir,

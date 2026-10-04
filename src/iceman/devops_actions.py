@@ -28,6 +28,7 @@ class DevOpsAction(str, Enum):
     DOCKER_SECURITY = "docker_security"
     DOCKER_OPTIMIZE = "docker_optimize"
     DOCKER_REBUILD_RESTART = "docker_rebuild_restart"
+    DOCKER_GUIDED_REPAIR = "docker_guided_repair"
     DOCKER_COMPOSE_STATUS = "docker_compose_status"
 
     K8S_CONTEXT = "k8s_context"
@@ -56,6 +57,7 @@ class DevOpsRequest:
     action: DevOpsAction
     component: str | None = None
     image: str | None = None
+    startup_target: str | None = None
     port: int | None = None
     replicas: int | None = None
     context: str | None = None
@@ -109,6 +111,7 @@ class DevOpsExecutionResult:
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
 _SAFE_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$")
 _SAFE_CONTEXT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/+\-]{0,255}$")
+_SAFE_STARTUP_TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]{0,127}$")
 
 
 def _quote(value: str) -> str:
@@ -132,6 +135,29 @@ def _safe_image(value: str | None) -> str | None:
     value = value.strip()
     if not _SAFE_IMAGE.fullmatch(value):
         raise ValueError("Unsafe container image reference.")
+    return value
+
+
+def _safe_startup_target(value: str | None) -> str | None:
+    """Validate an explicit application startup file supplied by the operator."""
+    if value is None:
+        return None
+
+    value = value.strip()
+    candidate = Path(value)
+
+    if (
+        not value
+        or not _SAFE_STARTUP_TARGET.fullmatch(value)
+        or candidate.is_absolute()
+        or ".." in candidate.parts
+        or "\\" in value
+    ):
+        raise ValueError(
+            "Startup target must be a safe relative application path such as "
+            "server.js or dist/server.js."
+        )
+
     return value
 
 
@@ -346,6 +372,40 @@ def _docker_image_exists(workspace: Path, image: str) -> bool:
     return result.returncode == 0
 
 
+def _docker_container_image(workspace: Path, container: str) -> str:
+    """Return only the configured image reference for a container."""
+    try:
+        result = run_command(
+            f"docker inspect --format {_quote('{{.Config.Image}}')} {_quote(container)}",
+            cwd=workspace,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise ValueError("Docker is not available for guided remediation.") from exc
+
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError(
+            f"Could not determine the image used by Docker container '{container}'."
+        )
+
+    return result.stdout.strip()
+
+
+def _docker_running_check_command(target: str) -> str:
+    """Build a bounded pass/fail runtime verification.
+
+    Unlike a plain `docker inspect`, this command returns non-zero when the
+    replacement container is no longer running after a short stabilization
+    period.
+    """
+    fmt = "{{.State.Running}}"
+    script = (
+        "sleep 2; "
+        f'value=$(docker inspect --format {_quote(fmt)} {_quote(target)}); '
+        'test "$value" = "true"'
+    )
+    return "sh -c " + _quote(script)
+
+
 def _env_map(values) -> dict[str, str]:
     output: dict[str, str] = {}
     if not isinstance(values, list):
@@ -362,6 +422,9 @@ def _standalone_recreate_recipe(
     workspace: Path,
     container: str,
     image: str,
+    *,
+    require_port_mapping: bool = True,
+    allow_command_override: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Return safe docker-run args for replacing a simple standalone container.
 
@@ -433,7 +496,13 @@ def _standalone_recreate_recipe(
         )
 
     image_config = image_data.get("Config") or {}
-    if config.get("Cmd") != image_config.get("Cmd") or config.get("Entrypoint") != image_config.get("Entrypoint"):
+    if (
+        not allow_command_override
+        and (
+            config.get("Cmd") != image_config.get("Cmd")
+            or config.get("Entrypoint") != image_config.get("Entrypoint")
+        )
+    ):
         raise ValueError(
             "Automatic rebuild/restart is disabled because the container overrides "
             "the image command or entrypoint."
@@ -456,7 +525,7 @@ def _standalone_recreate_recipe(
             suffix = "" if protocol == "tcp" else f"/{protocol}"
             mappings.append(f"{int(host_port)}:{container_port}{suffix}")
 
-    if not mappings:
+    if require_port_mapping and not mappings:
         raise ValueError(
             "Automatic rebuild/restart requires at least one explicit host port mapping."
         )
@@ -528,6 +597,269 @@ def _docker_history_command(image: str) -> str:
     # optimization output intentionally exposes only layer IDs and sizes.
     fmt = '{{.ID}}|{{.Size}}'
     return f"docker history --format {_quote(fmt)} {_quote(image)}"
+
+def build_guided_docker_repair_plan(
+    workspace: Path,
+    request: DevOpsRequest,
+    previous_result: DevOpsExecutionResult | None,
+) -> DevOpsPlan:
+    """Build a repair from a previous evidence-backed Docker diagnosis.
+
+    v0.9.9 intentionally supports only the failure class for which Iceman can
+    construct a bounded repair without guessing: a Node.js startup entry file
+    proven missing by the previous Docker diagnosis.
+
+    The replacement entry file must be explicitly supplied by the operator.
+    """
+    workspace = workspace.resolve()
+    plan = DevOpsPlan(
+        request=request,
+        workspace=workspace,
+        title="Guided Docker remediation",
+        requires_approval=True,
+    )
+
+    try:
+        if request.action != DevOpsAction.DOCKER_GUIDED_REPAIR:
+            raise ValueError("This planner only accepts docker_guided_repair.")
+
+        if previous_result is None:
+            raise ValueError(
+                "No recent DevOps diagnosis is available. Diagnose the container first."
+            )
+
+        if not previous_result.success:
+            raise ValueError(
+                "The previous Docker diagnosis did not complete successfully. "
+                "Run the diagnosis again before attempting repair."
+            )
+
+        if previous_result.plan.request.action != DevOpsAction.DOCKER_DIAGNOSE:
+            raise ValueError(
+                "The latest DevOps result is not a Docker diagnosis. "
+                "Diagnose the container immediately before guided repair."
+            )
+
+        diagnosed_target = (
+            previous_result.plan.inferred_component
+            or previous_result.plan.request.component
+        )
+        requested_target = _safe_name(
+            request.component or diagnosed_target,
+            field_name="container",
+        )
+
+        if not requested_target:
+            raise ValueError(
+                "A diagnosed Docker container is required for guided repair."
+            )
+
+        if requested_target != diagnosed_target:
+            raise ValueError(
+                f"The latest diagnosis is for '{diagnosed_target}', not "
+                f"'{requested_target}'. Diagnose '{requested_target}' first so "
+                "Iceman does not repair a different container from stale evidence."
+            )
+
+        startup_hint = _docker_startup_hint(previous_result.step_results)
+        if startup_hint is None:
+            raise ValueError(
+                "The previous diagnosis did not capture a safe startup command. "
+                "Re-run Docker diagnosis before guided repair."
+            )
+
+        log_result = next(
+            (
+                item.result
+                for item in previous_result.step_results
+                if "recent logs" in item.step.label.lower()
+            ),
+            None,
+        )
+        log_text = ""
+        if log_result is not None:
+            log_text = (log_result.stdout or "") + "\n" + (log_result.stderr or "")
+
+        missing = _node_missing_module_details(log_text, startup_hint)
+        if not missing or missing[0] != "entry_file":
+            raise ValueError(
+                "The latest diagnosis does not prove a missing Node.js startup "
+                "entry file. Iceman will not convert a different failure class "
+                "into a startup-command repair."
+            )
+
+        _, missing_target = missing
+        current_startup = _safe_effective_startup_command(startup_hint)
+        if not current_startup:
+            raise ValueError(
+                "Iceman could not safely reconstruct the diagnosed startup command."
+            )
+
+        try:
+            startup_tokens = shlex.split(current_startup)
+        except ValueError as exc:
+            raise ValueError(
+                "Iceman could not safely parse the diagnosed startup command."
+            ) from exc
+
+        if len(startup_tokens) != 2 or Path(startup_tokens[0]).name not in {
+            "node",
+            "nodejs",
+        }:
+            raise ValueError(
+                "Guided startup repair currently supports only a bounded Node.js "
+                "entry command such as 'node missing.js'."
+            )
+
+        replacement = _safe_startup_target(request.startup_target)
+        if replacement is None:
+            plan.safe_to_execute = False
+            plan.inferred_component = requested_target
+            plan.notes.extend([
+                (
+                    f"The previous diagnosis proves that startup target "
+                    f"'{missing_target}' is missing."
+                ),
+                (
+                    "Iceman cannot prove the intended replacement entry file and "
+                    "will not guess one."
+                ),
+                (
+                    f"Provide it explicitly, for example: "
+                    f"fix {requested_target} using server.js"
+                ),
+            ])
+            return plan
+
+        if replacement == startup_tokens[1]:
+            raise ValueError(
+                f"The supplied startup target '{replacement}' is the same target "
+                "that the diagnosis already proved missing."
+            )
+
+        if not _docker_container_exists(workspace, requested_target):
+            raise ValueError(
+                f"Docker container '{requested_target}' no longer exists. "
+                "Re-run diagnosis before repair."
+            )
+
+        image = _docker_container_image(workspace, requested_target)
+        run_args, mappings = _standalone_recreate_recipe(
+            workspace,
+            requested_target,
+            image,
+            require_port_mapping=False,
+            allow_command_override=True,
+        )
+
+        backup_name = f"{requested_target}-iceman-backup"
+        if _docker_container_exists(workspace, backup_name):
+            raise ValueError(
+                f"Safety backup container '{backup_name}' already exists. "
+                "Iceman will not overwrite or remove it automatically."
+            )
+
+        # Execution-time stale-evidence guard: if the startup shape changed after
+        # diagnosis, abort before any state-changing operation.
+        expected_hint = "|".join(startup_hint)
+        inspect_command = _docker_startup_hint_command(requested_target)
+        stale_check_script = (
+            f"actual=$({inspect_command}); "
+            f"test \"$actual\" = {_quote(expected_hint)}"
+        )
+
+        executable = startup_tokens[0]
+
+        run_command_parts = (
+            ["docker", "run", "-d", "--name", _quote(requested_target)]
+            + [_quote(item) for item in run_args]
+            + [
+                _quote(image),
+                _quote(executable),
+                _quote(replacement),
+            ]
+        )
+
+        plan.inferred_component = requested_target
+        plan.inferred_image = image
+
+        plan.steps.extend([
+            DevOpsStep(
+                "Verify diagnosed startup command is unchanged",
+                "sh -c " + _quote(stale_check_script),
+            ),
+            DevOpsStep(
+                f"Inspect current runtime state for {requested_target}",
+                _docker_state_command(requested_target),
+            ),
+            DevOpsStep(
+                f"Stop current container {requested_target}",
+                f"docker stop {_quote(requested_target)}",
+                changes_state=True,
+            ),
+            DevOpsStep(
+                f"Preserve current container as {backup_name}",
+                f"docker rename {_quote(requested_target)} {_quote(backup_name)}",
+                changes_state=True,
+            ),
+            DevOpsStep(
+                f"Start corrected container {requested_target}",
+                " ".join(run_command_parts),
+                changes_state=True,
+            ),
+            DevOpsStep(
+                f"Verify corrected container {requested_target} remains running",
+                _docker_running_check_command(requested_target),
+            ),
+            DevOpsStep(
+                f"Inspect repaired runtime state for {requested_target}",
+                _docker_state_command(requested_target),
+            ),
+            DevOpsStep(
+                f"Read bounded post-repair logs for {requested_target}",
+                f"docker logs --tail 40 {_quote(requested_target)}",
+                stream_output=False,
+            ),
+        ])
+
+        plan.notes.extend([
+            f"Evidence-backed failure: Node.js startup target '{missing_target}' is missing.",
+            f"Operator-supplied replacement startup target: '{replacement}'.",
+            (
+                f"The old container will be preserved as '{backup_name}' "
+                "for manual rollback."
+            ),
+            (
+                "Iceman will verify that the diagnosed startup command has not "
+                "changed before touching the container."
+            ),
+            (
+                "Recovery verification is pass/fail: the replacement must still "
+                "be running after a short stabilization period."
+            ),
+            (
+                "This changes the standalone container runtime command only. "
+                "Update the Dockerfile/Compose startup definition separately to "
+                "make the repair reproducible."
+            ),
+        ])
+
+        if mappings:
+            plan.notes.append(
+                "Recreated port mapping(s): " + ", ".join(mappings) + "."
+            )
+        else:
+            plan.notes.append(
+                "The diagnosed container has no host-published ports; none will "
+                "be invented during recreation."
+            )
+
+    except ValueError as exc:
+        plan.safe_to_execute = False
+        plan.notes.append(str(exc))
+
+    return plan
+
 
 def _terraform_dir(workspace: Path, explicit: str | None) -> str:
     if explicit:
@@ -1633,7 +1965,13 @@ def summarize_docker_execution(
 ) -> list[str]:
     summary: list[str] = []
     state_result = next(
-        (item.result for item in step_results if "runtime state" in item.step.label.lower() or "verify docker container" in item.step.label.lower() or "verify rebuilt container" in item.step.label.lower()),
+        (
+            item.result
+            for item in reversed(step_results)
+            if "runtime state" in item.step.label.lower()
+            or "verify docker container" in item.step.label.lower()
+            or "verify rebuilt container" in item.step.label.lower()
+        ),
         None,
     )
     if state_result is not None:
@@ -1757,7 +2095,7 @@ def _docker_execution_facts(
     state_result = next(
         (
             item.result
-            for item in step_results
+            for item in reversed(step_results)
             if "runtime state" in item.step.label.lower()
             or "verify docker container" in item.step.label.lower()
             or "verify rebuilt container" in item.step.label.lower()
@@ -1822,8 +2160,80 @@ def reason_docker_execution(
         health = state.get("health") or "none"
         restarts = state.get("restarts") or "0"
         exit_code = state.get("exit_code") or "unknown"
+        if action != DevOpsAction.DOCKER_GUIDED_REPAIR:
+            evidence.append(
+                f"Docker reports {target}: status={status}, exit={exit_code}, "
+                f"restarts={restarts}, health={health}."
+            )
+
+    if action == DevOpsAction.DOCKER_GUIDED_REPAIR:
+        pre_state_result = next(
+            (
+                item.result
+                for item in step_results
+                if "current runtime state" in item.step.label.lower()
+            ),
+            None,
+        )
+        post_state_result = next(
+            (
+                item.result
+                for item in reversed(step_results)
+                if "repaired runtime state" in item.step.label.lower()
+            ),
+            None,
+        )
+
+        pre_state = (
+            _parse_docker_state_line(pre_state_result.stdout)
+            if pre_state_result is not None
+            else None
+        )
+        post_state = (
+            _parse_docker_state_line(post_state_result.stdout)
+            if post_state_result is not None
+            else state
+        )
+
+        if pre_state:
+            evidence.append(
+                "Pre-repair Docker state: "
+                f"status={pre_state.get('status') or 'unknown'}, "
+                f"exit={pre_state.get('exit_code') or 'unknown'}, "
+                f"restarts={pre_state.get('restarts') or '0'}, "
+                f"health={pre_state.get('health') or 'none'}."
+            )
+
+        if plan.request.startup_target:
+            evidence.append(
+                "Replacement startup target explicitly supplied by operator: "
+                f"'{plan.request.startup_target}'."
+            )
+
+        if post_state:
+            evidence.append(
+                "Post-repair Docker state: "
+                f"status={post_state.get('status') or 'unknown'}, "
+                f"exit={post_state.get('exit_code') or 'unknown'}, "
+                f"restarts={post_state.get('restarts') or '0'}, "
+                f"health={post_state.get('health') or 'none'}."
+            )
+
+        post_logs = next(
+            (
+                item.result
+                for item in reversed(step_results)
+                if "post-repair logs" in item.step.label.lower()
+            ),
+            None,
+        )
+        if post_logs is not None and post_logs.returncode == 0:
+            evidence.append(
+                "Bounded post-repair logs were collected successfully."
+            )
+
         evidence.append(
-            f"Docker reports {target}: status={status}, exit={exit_code}, restarts={restarts}, health={health}."
+            f"Rollback backup preserved as '{target}-iceman-backup'."
         )
 
     if action == DevOpsAction.DOCKER_CONNECTIVITY:
@@ -2138,6 +2548,11 @@ def execute_devops_plan(
         summary.append(f"Docker container started and verified: {plan.inferred_component}")
     if plan.request.action == DevOpsAction.DOCKER_REBUILD_RESTART and plan.inferred_component:
         summary.append(f"Docker container rebuilt, replaced, and verified: {plan.inferred_component}")
+    if plan.request.action == DevOpsAction.DOCKER_GUIDED_REPAIR and plan.inferred_component:
+        summary.append(
+            f"Guided Docker repair applied and running-state verification passed: "
+            f"{plan.inferred_component}"
+        )
     if plan.request.action == DevOpsAction.K8S_DEPLOY:
         summary.append("Kubernetes deployment workflow completed successfully.")
     if plan.request.action == DevOpsAction.TERRAFORM_VALIDATE:

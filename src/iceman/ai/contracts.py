@@ -110,6 +110,16 @@ class AIIntent(BaseModel):
             "Never invent credentials or embed secrets."
         ),
     )
+    startup_target: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "For docker_guided_repair only: an explicit relative startup entry "
+            "file supplied by the user, such as server.js or dist/server.js. "
+            "Never invent this value."
+        ),
+    )
+
     devops_action: DevOpsAction | None = Field(
         default=None,
         description=(
