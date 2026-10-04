@@ -33,6 +33,7 @@ class DevOpsAction(str, Enum):
 
     K8S_CONTEXT = "k8s_context"
     K8S_CONTEXTS = "k8s_contexts"
+    K8S_NAMESPACES = "k8s_namespaces"
     K8S_VALIDATE = "k8s_validate"
     K8S_DEPLOY = "k8s_deploy"
     K8S_PODS = "k8s_pods"
@@ -2088,6 +2089,35 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
                     "patches, deletes, or recreates Kubernetes resources."
                 ),
             ])
+
+        elif action == DevOpsAction.K8S_NAMESPACES:
+            current_context = _current_k8s_context(workspace)
+            contexts = _available_k8s_contexts(workspace)
+
+            if not current_context:
+                raise ValueError(
+                    "No active Kubernetes context is available for namespace listing."
+                )
+
+            if current_context not in contexts:
+                raise ValueError(
+                    f"Kubernetes context '{current_context}' was not found. "
+                    f"Available contexts: {', '.join(contexts)}."
+                )
+
+            plan.target_context = current_context
+            plan.context_inferred = True
+            plan.steps.append(
+                DevOpsStep(
+                    "List Kubernetes namespaces",
+                    f"kubectl --context {_quote(current_context)} "
+                    "get namespaces -o wide",
+                )
+            )
+            plan.notes.append(
+                f"Namespace listing is read-only and scoped to Kubernetes "
+                f"context '{current_context}'."
+            )
 
         elif action == DevOpsAction.K8S_DEPLOYMENTS:
             plan.steps.append(DevOpsStep("Show Kubernetes deployments", "kubectl get deployments"))

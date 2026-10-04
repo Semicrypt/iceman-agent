@@ -60,7 +60,7 @@ Available trusted actions:
   docker_restart, docker_diagnose, docker_health, docker_ports, docker_connectivity,
   docker_security, docker_optimize, docker_rebuild_restart, docker_guided_repair,
   docker_compose_status.
-  Kubernetes actions: k8s_context, k8s_contexts, k8s_validate, k8s_deploy,
+  Kubernetes actions: k8s_context, k8s_contexts, k8s_namespaces, k8s_validate, k8s_deploy,
   k8s_pods, k8s_diagnose_pod, k8s_diagnose_service, k8s_diagnose_deployment, k8s_deployments, k8s_services, k8s_rollout,
   k8s_scale, k8s_logs, k8s_describe, k8s_restart.
   Terraform actions: terraform_init, terraform_fmt, terraform_validate,

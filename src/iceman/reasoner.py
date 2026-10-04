@@ -455,6 +455,21 @@ def _extract_devops_action_request(
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Show the current Kubernetes context.", devops_action=DevOpsAction.K8S_CONTEXT)
     if lower in {"show kubernetes contexts", "list kubernetes contexts", "show me kubernetes contexts"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "List Kubernetes contexts.", devops_action=DevOpsAction.K8S_CONTEXTS)
+    if lower in {
+        "show namespaces",
+        "list namespaces",
+        "show kubernetes namespaces",
+        "list kubernetes namespaces",
+        "show k8s namespaces",
+        "list k8s namespaces",
+        "show ns",
+        "list ns",
+    }:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            "List namespaces in the active Kubernetes context.",
+            devops_action=DevOpsAction.K8S_NAMESPACES,
+        )
     if ("validate" in lower or "check" in lower) and ("kubernetes" in lower or "k8s" in lower or "manifest" in lower):
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Validate Kubernetes manifests using kubectl client dry-run.", devops_action=DevOpsAction.K8S_VALIDATE)
     match = re.match(r"^deploy\s+(?:the\s+)?([A-Za-z0-9_.-]+)(?:\s+to\s+(?:the\s+)?([A-Za-z0-9_.:@/+\-]+)(?:\s+cluster)?)?$", lower)
