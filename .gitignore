@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.py[cod]
+.coverage
+htmlcov/
+
+# Environment / local secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Build outputs
+dist/
+build/
+coverage/
+.next/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfvars
+!*.tfvars.example
+.terraform.tfstate.lock.info
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
