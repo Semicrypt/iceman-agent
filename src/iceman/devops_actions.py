@@ -3514,21 +3514,37 @@ _TERRAFORM_CHANGE_HEADER = re.compile(
 )
 
 
+def _terraform_resource_type_from_address(address: str) -> str:
+    """Extract the resource type while correctly skipping module path segments."""
+
+    parts = address.split(".")
+    index = 0
+
+    while index < len(parts):
+        token = re.sub(r"\[.*$", "", parts[index]).strip()
+
+        if token == "module":
+            index += 2
+            continue
+
+        if token == "data":
+            index += 1
+            if index < len(parts):
+                return re.sub(r"\[.*$", "", parts[index]).strip()
+            return ""
+
+        if "_" in token:
+            return token
+
+        index += 1
+
+    return ""
+
+
 def _terraform_provider_for_address(address: str) -> str:
     """Classify a Terraform resource address without requiring provider APIs."""
 
-    tokens = re.findall(
-        r"(?:^|\.)([A-Za-z][A-Za-z0-9_]+)(?=\.)",
-        address,
-    )
-
-    resource_type = ""
-    for token in tokens:
-        if token == "module" or token == "data":
-            continue
-        if "_" in token:
-            resource_type = token
-            break
+    resource_type = _terraform_resource_type_from_address(address)
 
     if resource_type.startswith("aws_"):
         return "AWS"
@@ -3545,6 +3561,481 @@ def _terraform_provider_for_address(address: str) -> str:
 
     return "Other"
 
+
+def _terraform_change_sections(output: str) -> dict[str, str]:
+    """Return each Terraform plan resource section keyed by resource address."""
+
+    matches = list(_TERRAFORM_CHANGE_HEADER.finditer(output))
+    sections: dict[str, str] = {}
+
+    for index, match in enumerate(matches):
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(output)
+        )
+
+        body = output[match.end():end]
+
+        plan_marker = re.search(
+            r"(?m)^\s*Plan:\s+\d+\s+to add,",
+            body,
+        )
+        if plan_marker:
+            body = body[:plan_marker.start()]
+
+        sections[match.group(1).strip()] = body
+
+    return sections
+
+
+def _terraform_planned_text(block: str) -> str:
+    """Reduce diff text to the planned/resulting values where possible."""
+
+    planned: list[str] = []
+
+    for raw in block.splitlines():
+        line = raw.lstrip()
+
+        if not line:
+            continue
+
+        # Pure deletion means the value will no longer exist.
+        if line.startswith("- ") and " -> " not in line:
+            continue
+
+        if line.startswith("-/+ "):
+            line = line[4:].lstrip()
+        elif line.startswith(("<= ", "+ ", "~ ")):
+            line = line[2:].lstrip()
+
+        # For changed scalar values retain the attribute name but only
+        # inspect the planned right-hand value.
+        if " -> " in line:
+            left, right = line.rsplit(" -> ", 1)
+
+            if "=" in left:
+                key = left.split("=", 1)[0].strip()
+                line = f"{key} = {right.strip()}"
+            else:
+                line = right.strip()
+
+        planned.append(line)
+
+    return "\n".join(planned)
+
+
+def _terraform_attr_bool(
+    text: str,
+    name: str,
+) -> bool | None:
+    match = re.search(
+        rf"(?mi)^\s*{re.escape(name)}\s*=\s*(true|false)\b",
+        text,
+    )
+    if not match:
+        return None
+
+    return match.group(1).lower() == "true"
+
+
+def _terraform_attr_int(
+    text: str,
+    name: str,
+) -> int | None:
+    match = re.search(
+        rf"(?mi)^\s*{re.escape(name)}\s*=\s*(-?\d+)\b",
+        text,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _terraform_attr_string(
+    text: str,
+    name: str,
+) -> str | None:
+    match = re.search(
+        rf'(?mi)^\s*{re.escape(name)}\s*=\s*"([^"]+)"',
+        text,
+    )
+    return match.group(1) if match else None
+
+
+def _terraform_aws_category(resource_type: str) -> str:
+    if resource_type.startswith("aws_iam_"):
+        return "iam"
+
+    if resource_type.startswith((
+        "aws_security_group",
+        "aws_vpc_security_group_",
+        "aws_network_acl",
+        "aws_wafv2_",
+    )):
+        return "security"
+
+    if resource_type.startswith((
+        "aws_lb",
+        "aws_alb",
+        "aws_elb",
+    )):
+        return "load_balancing"
+
+    if resource_type.startswith((
+        "aws_db_",
+        "aws_rds_",
+        "aws_dynamodb_",
+        "aws_elasticache_",
+        "aws_redshift_",
+    )):
+        return "database"
+
+    if resource_type.startswith((
+        "aws_s3_",
+        "aws_ebs_",
+        "aws_efs_",
+        "aws_fsx_",
+    )):
+        return "storage"
+
+    if resource_type.startswith((
+        "aws_vpc",
+        "aws_subnet",
+        "aws_route",
+        "aws_nat_gateway",
+        "aws_internet_gateway",
+        "aws_eip",
+    )):
+        return "networking"
+
+    if resource_type.startswith((
+        "aws_instance",
+        "aws_launch_template",
+        "aws_autoscaling_",
+        "aws_ecs_",
+        "aws_eks_",
+        "aws_lambda_",
+    )):
+        return "compute"
+
+    return "other"
+
+
+def _terraform_aws_cost_bearing(resource_type: str) -> bool:
+    exact = {
+        "aws_instance",
+        "aws_nat_gateway",
+        "aws_db_instance",
+        "aws_rds_cluster",
+        "aws_lb",
+        "aws_alb",
+        "aws_elb",
+        "aws_eip",
+        "aws_ebs_volume",
+        "aws_efs_file_system",
+        "aws_eks_cluster",
+    }
+
+    prefixes = (
+        "aws_elasticache_",
+        "aws_redshift_",
+        "aws_opensearch_",
+    )
+
+    return (
+        resource_type in exact
+        or resource_type.startswith(prefixes)
+    )
+
+
+def _analyze_terraform_aws(
+    changes: list[dict[str, str]],
+    sections: dict[str, str],
+) -> dict[str, object]:
+    category_order = (
+        "compute",
+        "networking",
+        "security",
+        "load_balancing",
+        "database",
+        "storage",
+        "iam",
+        "other",
+    )
+
+    categories = {
+        name: 0
+        for name in category_order
+    }
+
+    findings: list[str] = []
+    cost_resources: list[str] = []
+    resource_count = 0
+
+    for item in changes:
+        if (
+            item.get("provider") != "AWS"
+            or item.get("action") == "read"
+        ):
+            continue
+
+        resource_count += 1
+
+        address = item["address"]
+        action = item["action"]
+        resource_type = (
+            item.get("resource_type")
+            or _terraform_resource_type_from_address(address)
+        )
+
+        category = _terraform_aws_category(resource_type)
+        categories[category] += 1
+
+        planned = _terraform_planned_text(
+            sections.get(address, "")
+        )
+
+        # ----------------------------------------------------
+        # Security Groups
+        # ----------------------------------------------------
+        if resource_type.startswith((
+            "aws_security_group",
+            "aws_vpc_security_group_ingress_rule",
+        )):
+            world_open = (
+                "0.0.0.0/0" in planned
+                or "::/0" in planned
+            )
+
+            if world_open:
+                from_port = _terraform_attr_int(
+                    planned,
+                    "from_port",
+                )
+                to_port = _terraform_attr_int(
+                    planned,
+                    "to_port",
+                )
+
+                sensitive: list[str] = []
+
+                if (
+                    from_port is not None
+                    and to_port is not None
+                ):
+                    if from_port <= 22 <= to_port:
+                        sensitive.append("SSH (22)")
+
+                    if from_port <= 3389 <= to_port:
+                        sensitive.append("RDP (3389)")
+
+                if sensitive:
+                    findings.append(
+                        f"AWS security warning: {address} allows "
+                        "world-open ingress reaching "
+                        + ", ".join(sensitive)
+                        + "."
+                    )
+                else:
+                    findings.append(
+                        f"AWS network-exposure warning: {address} "
+                        "allows world-open ingress."
+                    )
+
+        # ----------------------------------------------------
+        # EC2 / subnet public exposure
+        # ----------------------------------------------------
+        if (
+            resource_type == "aws_instance"
+            and _terraform_attr_bool(
+                planned,
+                "associate_public_ip_address",
+            ) is True
+        ):
+            findings.append(
+                f"AWS exposure warning: {address} is planned "
+                "with a public IPv4 address."
+            )
+
+        if (
+            resource_type == "aws_subnet"
+            and _terraform_attr_bool(
+                planned,
+                "map_public_ip_on_launch",
+            ) is True
+        ):
+            findings.append(
+                f"AWS exposure warning: {address} auto-assigns "
+                "public IPv4 addresses."
+            )
+
+        # ----------------------------------------------------
+        # RDS
+        # ----------------------------------------------------
+        if resource_type in {
+            "aws_db_instance",
+            "aws_rds_cluster",
+        }:
+            if _terraform_attr_bool(
+                planned,
+                "publicly_accessible",
+            ) is True:
+                findings.append(
+                    f"AWS database warning: {address} is planned "
+                    "as publicly accessible."
+                )
+
+            if _terraform_attr_bool(
+                planned,
+                "storage_encrypted",
+            ) is False:
+                findings.append(
+                    f"AWS database warning: {address} explicitly "
+                    "disables storage encryption."
+                )
+
+        # ----------------------------------------------------
+        # S3
+        # ----------------------------------------------------
+        if resource_type == "aws_s3_bucket":
+            acl = (
+                _terraform_attr_string(
+                    planned,
+                    "acl",
+                )
+                or ""
+            ).lower()
+
+            if acl in {
+                "public-read",
+                "public-read-write",
+                "website",
+            }:
+                findings.append(
+                    f"AWS S3 warning: {address} uses public ACL "
+                    f"'{acl}'."
+                )
+
+        if (
+            resource_type
+            == "aws_s3_bucket_public_access_block"
+        ):
+            disabled = [
+                name
+                for name in (
+                    "block_public_acls",
+                    "block_public_policy",
+                    "ignore_public_acls",
+                    "restrict_public_buckets",
+                )
+                if _terraform_attr_bool(
+                    planned,
+                    name,
+                ) is False
+            ]
+
+            if disabled:
+                findings.append(
+                    f"AWS S3 warning: {address} disables "
+                    "public-access protection(s): "
+                    + ", ".join(disabled)
+                    + "."
+                )
+
+        if resource_type == "aws_s3_bucket_policy":
+            public_principal = bool(
+                re.search(
+                    r'(?is)\bPrincipal\b.{0,240}"\*"',
+                    planned,
+                )
+            )
+            allow_effect = bool(
+                re.search(
+                    r'(?is)\bEffect\b.{0,80}"Allow"',
+                    planned,
+                )
+            )
+
+            if public_principal and allow_effect:
+                findings.append(
+                    f"AWS S3 warning: {address} appears to allow "
+                    "a public principal."
+                )
+
+        # ----------------------------------------------------
+        # IAM
+        # ----------------------------------------------------
+        if (
+            resource_type.startswith("aws_iam_")
+            and "policy" in resource_type
+        ):
+            wildcard_action = bool(
+                re.search(
+                    r'(?is)\bAction\b.{0,300}"\*"',
+                    planned,
+                )
+            )
+            wildcard_resource = bool(
+                re.search(
+                    r'(?is)\bResource\b.{0,300}"\*"',
+                    planned,
+                )
+            )
+
+            if wildcard_action and wildcard_resource:
+                findings.append(
+                    f"AWS IAM warning: {address} appears to grant "
+                    "wildcard Action and Resource permissions."
+                )
+            elif wildcard_action:
+                findings.append(
+                    f"AWS IAM warning: {address} appears to grant "
+                    "wildcard Action permissions."
+                )
+
+        # ----------------------------------------------------
+        # Load balancer exposure
+        # ----------------------------------------------------
+        if resource_type.startswith((
+            "aws_lb",
+            "aws_alb",
+            "aws_elb",
+        )):
+            internal = _terraform_attr_bool(
+                planned,
+                "internal",
+            )
+
+            if internal is False:
+                findings.append(
+                    f"AWS exposure observation: {address} is "
+                    "planned as internet-facing."
+                )
+
+        # ----------------------------------------------------
+        # Cost-bearing classes
+        # ----------------------------------------------------
+        if (
+            action in {"create", "update", "replace"}
+            and _terraform_aws_cost_bearing(
+                resource_type
+            )
+        ):
+            cost_resources.append(address)
+
+    return {
+        "resource_count": resource_count,
+        "categories": {
+            name: count
+            for name, count in categories.items()
+            if count
+        },
+        "findings": list(
+            dict.fromkeys(findings)
+        )[:8],
+        "cost_resources": list(
+            dict.fromkeys(cost_resources)
+        )[:8],
+    }
 
 def analyze_terraform_plan(output: str) -> dict[str, object]:
     """Extract bounded, provider-aware intelligence from Terraform plan text."""
@@ -3580,6 +4071,7 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
 
     changes: list[dict[str, str]] = []
     providers: list[str] = []
+    sections = _terraform_change_sections(output)
 
     for match in _TERRAFORM_CHANGE_HEADER.finditer(output):
         address = match.group(1).strip()
@@ -3590,6 +4082,9 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
             "address": address,
             "action": action,
             "provider": provider,
+            "resource_type": _terraform_resource_type_from_address(
+                address
+            ),
         })
 
         if provider not in providers:
@@ -3615,6 +4110,11 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
         or explicit_destroys > 0
     )
 
+    aws = _analyze_terraform_aws(
+        changes,
+        sections,
+    )
+
     return {
         "no_changes": no_changes,
         "totals": totals,
@@ -3622,6 +4122,7 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
         "providers": providers,
         "replacements": replacements,
         "destructive": destructive,
+        "aws": aws,
     }
 
 
@@ -3636,6 +4137,7 @@ def summarize_terraform_plan(output: str) -> list[str]:
     providers = analysis["providers"]
     replacements = int(analysis["replacements"])
     destructive = bool(analysis["destructive"])
+    aws = analysis.get("aws")
 
     summary: list[str] = []
 
@@ -3667,6 +4169,66 @@ def summarize_terraform_plan(output: str) -> list[str]:
             "resource destruction or replacement. Iceman will not apply "
             "or destroy infrastructure automatically."
         )
+
+    if (
+        isinstance(aws, dict)
+        and aws.get("resource_count")
+    ):
+        categories = aws.get("categories", {})
+
+        category_labels = {
+            "compute": "compute",
+            "networking": "networking",
+            "security": "security",
+            "load_balancing": "load-balancing",
+            "database": "database",
+            "storage": "storage",
+            "iam": "IAM",
+            "other": "other",
+        }
+
+        if isinstance(categories, dict):
+            rendered_categories = ", ".join(
+                f"{category_labels.get(name, name)}={count}"
+                for name, count in categories.items()
+            )
+
+            if rendered_categories:
+                summary.append(
+                    "AWS Terraform intelligence: planned resource "
+                    "activity by family: "
+                    + rendered_categories
+                    + "."
+                )
+
+        findings = aws.get("findings", [])
+
+        if isinstance(findings, list):
+            summary.extend(
+                str(item)
+                for item in findings[:8]
+            )
+
+        cost_resources = aws.get(
+            "cost_resources",
+            [],
+        )
+
+        if (
+            isinstance(cost_resources, list)
+            and cost_resources
+        ):
+            summary.append(
+                "AWS cost awareness: planned create/update/replace "
+                "activity touches commonly billable AWS resource "
+                "classes: "
+                + ", ".join(
+                    str(item)
+                    for item in cost_resources[:8]
+                )
+                + ". No dollar estimate is made without current "
+                "pricing and account context."
+            )
 
     action_labels = {
         "create": "CREATE",
