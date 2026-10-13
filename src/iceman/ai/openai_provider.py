@@ -145,6 +145,9 @@ Rules:
    from Terraform's read-only plan output. Never reinterpret this as apply.
    For AWS plans, report only bounded evidence present in the Terraform plan.
    Never invent credentials, AWS account state, exposure, or dollar pricing.
+   For Azure plans, report only bounded evidence present in the Terraform plan.
+   Never invent Azure credentials, subscription state, exposure, SKU details,
+   or dollar pricing.
 21. Terraform apply/destroy and Kubernetes delete are not exposed as trusted actions.
    For requests to apply/destroy infrastructure or delete cluster resources,
    choose fallback rather than attempting to encode a command.

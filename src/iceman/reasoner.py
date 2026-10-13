@@ -578,6 +578,12 @@ def _extract_devops_action_request(
         "review the aws terraform plan",
         "explain aws terraform plan",
         "explain the aws terraform plan",
+        "analyze azure terraform plan",
+        "analyze the azure terraform plan",
+        "review azure terraform plan",
+        "review the azure terraform plan",
+        "explain azure terraform plan",
+        "explain the azure terraform plan",
     }:
         return ReasoningDecision(
             ReasoningAction.EXECUTE_DEVOPS_ACTION,

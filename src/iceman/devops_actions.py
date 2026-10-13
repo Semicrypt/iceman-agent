@@ -4037,6 +4037,538 @@ def _analyze_terraform_aws(
         )[:8],
     }
 
+
+def _terraform_azure_category(resource_type: str) -> str:
+    if resource_type.startswith((
+        "azurerm_role_assignment",
+        "azurerm_user_assigned_identity",
+        "azuread_",
+    )):
+        return "identity"
+
+    if resource_type.startswith((
+        "azurerm_network_security_group",
+        "azurerm_network_security_rule",
+        "azurerm_web_application_firewall",
+    )):
+        return "security"
+
+    if resource_type.startswith((
+        "azurerm_application_gateway",
+        "azurerm_lb",
+    )):
+        return "load_balancing"
+
+    if resource_type.startswith((
+        "azurerm_mssql_",
+        "azurerm_sql_",
+        "azurerm_postgresql_",
+        "azurerm_mysql_",
+        "azurerm_cosmosdb_",
+        "azurerm_redis_",
+    )):
+        return "database"
+
+    if resource_type.startswith((
+        "azurerm_storage_",
+        "azurerm_managed_disk",
+        "azurerm_data_lake_",
+    )):
+        return "storage"
+
+    if resource_type.startswith((
+        "azurerm_key_vault",
+    )):
+        return "secrets"
+
+    if resource_type.startswith((
+        "azurerm_virtual_network",
+        "azurerm_subnet",
+        "azurerm_public_ip",
+        "azurerm_network_interface",
+        "azurerm_nat_gateway",
+        "azurerm_route",
+        "azurerm_private_endpoint",
+    )):
+        return "networking"
+
+    if resource_type.startswith((
+        "azurerm_linux_virtual_machine",
+        "azurerm_windows_virtual_machine",
+        "azurerm_virtual_machine",
+        "azurerm_virtual_machine_scale_set",
+        "azurerm_linux_virtual_machine_scale_set",
+        "azurerm_windows_virtual_machine_scale_set",
+        "azurerm_function_app",
+        "azurerm_linux_function_app",
+        "azurerm_windows_function_app",
+        "azurerm_app_service",
+        "azurerm_linux_web_app",
+        "azurerm_windows_web_app",
+    )):
+        return "compute"
+
+    if resource_type.startswith((
+        "azurerm_kubernetes_cluster",
+        "azurerm_kubernetes_cluster_node_pool",
+        "azurerm_container_registry",
+        "azurerm_container_group",
+    )):
+        return "containers"
+
+    return "other"
+
+
+def _terraform_azure_cost_bearing(resource_type: str) -> bool:
+    exact = {
+        "azurerm_linux_virtual_machine",
+        "azurerm_windows_virtual_machine",
+        "azurerm_virtual_machine",
+        "azurerm_managed_disk",
+        "azurerm_nat_gateway",
+        "azurerm_application_gateway",
+        "azurerm_lb",
+        "azurerm_mssql_database",
+        "azurerm_public_ip",
+        "azurerm_kubernetes_cluster_node_pool",
+        "azurerm_container_group",
+        "azurerm_redis_cache",
+    }
+
+    prefixes = (
+        "azurerm_postgresql_",
+        "azurerm_mysql_",
+        "azurerm_cosmosdb_",
+        "azurerm_linux_virtual_machine_scale_set",
+        "azurerm_windows_virtual_machine_scale_set",
+    )
+
+    return (
+        resource_type in exact
+        or resource_type.startswith(prefixes)
+    )
+
+
+def _terraform_azure_world_open(text: str) -> bool:
+    patterns = (
+        r'(?mi)^\s*source_address_prefix\s*=\s*"\*"',
+        r'(?mi)^\s*source_address_prefix\s*=\s*"0\.0\.0\.0/0"',
+        r'(?mi)^\s*source_address_prefix\s*=\s*"::/0"',
+        r'(?mi)^\s*source_address_prefixes\s*=.*0\.0\.0\.0/0',
+        r'(?mi)^\s*source_address_prefixes\s*=.*::/0',
+    )
+
+    return any(
+        re.search(pattern, text)
+        for pattern in patterns
+    )
+
+
+def _terraform_azure_sensitive_port(
+    text: str,
+) -> str | None:
+    single = _terraform_attr_string(
+        text,
+        "destination_port_range",
+    )
+
+    candidates = []
+
+    if single:
+        candidates.append(single.strip())
+
+    list_match = re.search(
+        r"(?mis)^\s*destination_port_ranges\s*=\s*\[(.*?)\]",
+        text,
+    )
+    if list_match:
+        candidates.extend(
+            re.findall(
+                r'"([^"]+)"',
+                list_match.group(1),
+            )
+        )
+
+    for candidate in candidates:
+        if candidate == "*":
+            return "all ports"
+
+        if candidate == "22":
+            return "SSH (22)"
+
+        if candidate == "3389":
+            return "RDP (3389)"
+
+        range_match = re.fullmatch(
+            r"(\d+)-(\d+)",
+            candidate,
+        )
+        if range_match:
+            start, end = map(
+                int,
+                range_match.groups(),
+            )
+
+            if start <= 22 <= end:
+                return "SSH (22)"
+
+            if start <= 3389 <= end:
+                return "RDP (3389)"
+
+    return None
+
+
+def _analyze_terraform_azure(
+    changes: list[dict[str, str]],
+    sections: dict[str, str],
+) -> dict[str, object]:
+    category_order = (
+        "compute",
+        "containers",
+        "networking",
+        "security",
+        "load_balancing",
+        "database",
+        "storage",
+        "secrets",
+        "identity",
+        "other",
+    )
+
+    categories = {
+        name: 0
+        for name in category_order
+    }
+
+    findings: list[str] = []
+    cost_resources: list[str] = []
+    resource_count = 0
+
+    for item in changes:
+        if (
+            item.get("provider")
+            not in {"AzureRM", "AzureAD"}
+            or item.get("action") == "read"
+        ):
+            continue
+
+        resource_count += 1
+
+        address = item["address"]
+        action = item["action"]
+        resource_type = (
+            item.get("resource_type")
+            or _terraform_resource_type_from_address(
+                address
+            )
+        )
+
+        category = _terraform_azure_category(
+            resource_type
+        )
+        categories[category] += 1
+
+        planned = _terraform_planned_text(
+            sections.get(address, "")
+        )
+
+        # ----------------------------------------------------
+        # Network Security Groups / rules
+        # ----------------------------------------------------
+        if resource_type.startswith((
+            "azurerm_network_security_group",
+            "azurerm_network_security_rule",
+        )):
+            access = (
+                _terraform_attr_string(
+                    planned,
+                    "access",
+                )
+                or "Allow"
+            ).lower()
+
+            direction = (
+                _terraform_attr_string(
+                    planned,
+                    "direction",
+                )
+                or "Inbound"
+            ).lower()
+
+            if (
+                access == "allow"
+                and direction == "inbound"
+                and _terraform_azure_world_open(
+                    planned
+                )
+            ):
+                sensitive = (
+                    _terraform_azure_sensitive_port(
+                        planned
+                    )
+                )
+
+                if sensitive:
+                    findings.append(
+                        f"Azure security warning: {address} allows "
+                        f"world-open inbound access reaching {sensitive}."
+                    )
+                else:
+                    findings.append(
+                        f"Azure network-exposure warning: {address} "
+                        "allows world-open inbound access."
+                    )
+
+        # ----------------------------------------------------
+        # Public IP / NIC exposure
+        # ----------------------------------------------------
+        if resource_type == "azurerm_public_ip":
+            findings.append(
+                f"Azure exposure observation: {address} creates "
+                "a public IP resource."
+            )
+
+        if (
+            resource_type
+            == "azurerm_network_interface"
+            and re.search(
+                r"(?mi)^\s*public_ip_address_id\s*=",
+                planned,
+            )
+        ):
+            findings.append(
+                f"Azure exposure observation: {address} associates "
+                "a network interface with a public IP."
+            )
+
+        # ----------------------------------------------------
+        # Azure SQL / PostgreSQL / MySQL
+        # ----------------------------------------------------
+        if resource_type.startswith((
+            "azurerm_mssql_",
+            "azurerm_sql_",
+            "azurerm_postgresql_",
+            "azurerm_mysql_",
+        )):
+            if _terraform_attr_bool(
+                planned,
+                "public_network_access_enabled",
+            ) is True:
+                findings.append(
+                    f"Azure database warning: {address} enables "
+                    "public network access."
+                )
+
+            minimum_tls = (
+                _terraform_attr_string(
+                    planned,
+                    "minimum_tls_version",
+                )
+                or _terraform_attr_string(
+                    planned,
+                    "ssl_minimal_tls_version_enforced",
+                )
+            )
+
+            if minimum_tls and minimum_tls.lower() in {
+                "1.0",
+                "1.1",
+                "tls1_0",
+                "tls1_1",
+            }:
+                findings.append(
+                    f"Azure database warning: {address} permits "
+                    f"legacy minimum TLS version {minimum_tls}."
+                )
+
+        # ----------------------------------------------------
+        # Storage
+        # ----------------------------------------------------
+        if resource_type == "azurerm_storage_account":
+            public_flags = (
+                "allow_nested_items_to_be_public",
+                "allow_blob_public_access",
+            )
+
+            if any(
+                _terraform_attr_bool(
+                    planned,
+                    flag,
+                ) is True
+                for flag in public_flags
+            ):
+                findings.append(
+                    f"Azure Storage warning: {address} allows "
+                    "blob/container public access."
+                )
+
+            minimum_tls = _terraform_attr_string(
+                planned,
+                "min_tls_version",
+            )
+
+            if minimum_tls and minimum_tls.upper() in {
+                "TLS1_0",
+                "TLS1_1",
+            }:
+                findings.append(
+                    f"Azure Storage warning: {address} permits "
+                    f"legacy minimum TLS version {minimum_tls}."
+                )
+
+        if resource_type == "azurerm_storage_container":
+            access_type = (
+                _terraform_attr_string(
+                    planned,
+                    "container_access_type",
+                )
+                or ""
+            ).lower()
+
+            if access_type in {
+                "blob",
+                "container",
+            }:
+                findings.append(
+                    f"Azure Storage warning: {address} uses public "
+                    f"container access type '{access_type}'."
+                )
+
+        # ----------------------------------------------------
+        # Key Vault
+        # ----------------------------------------------------
+        if resource_type == "azurerm_key_vault":
+            if _terraform_attr_bool(
+                planned,
+                "purge_protection_enabled",
+            ) is False:
+                findings.append(
+                    f"Azure Key Vault warning: {address} explicitly "
+                    "disables purge protection."
+                )
+
+            if _terraform_attr_bool(
+                planned,
+                "public_network_access_enabled",
+            ) is True:
+                findings.append(
+                    f"Azure Key Vault exposure observation: {address} "
+                    "enables public network access."
+                )
+
+        # ----------------------------------------------------
+        # Azure RBAC
+        # ----------------------------------------------------
+        if resource_type == "azurerm_role_assignment":
+            role_name = (
+                _terraform_attr_string(
+                    planned,
+                    "role_definition_name",
+                )
+                or ""
+            )
+
+            if role_name.lower() in {
+                "owner",
+                "contributor",
+                "user access administrator",
+            }:
+                findings.append(
+                    f"Azure RBAC warning: {address} assigns highly "
+                    f"privileged role '{role_name}'."
+                )
+
+        # ----------------------------------------------------
+        # Azure Container Registry
+        # ----------------------------------------------------
+        if resource_type == "azurerm_container_registry":
+            if _terraform_attr_bool(
+                planned,
+                "admin_enabled",
+            ) is True:
+                findings.append(
+                    f"Azure Container Registry warning: {address} "
+                    "enables the registry admin account."
+                )
+
+            if _terraform_attr_bool(
+                planned,
+                "public_network_access_enabled",
+            ) is True:
+                findings.append(
+                    f"Azure Container Registry exposure observation: "
+                    f"{address} enables public network access."
+                )
+
+        # ----------------------------------------------------
+        # AKS
+        # ----------------------------------------------------
+        if resource_type == "azurerm_kubernetes_cluster":
+            if _terraform_attr_bool(
+                planned,
+                "private_cluster_enabled",
+            ) is False:
+                findings.append(
+                    f"Azure AKS exposure observation: {address} is "
+                    "planned without a private cluster API endpoint."
+                )
+
+            if _terraform_attr_bool(
+                planned,
+                "local_account_disabled",
+            ) is False:
+                findings.append(
+                    f"Azure AKS security observation: {address} "
+                    "keeps local cluster accounts enabled."
+                )
+
+        # ----------------------------------------------------
+        # Load balancer / Application Gateway exposure
+        # ----------------------------------------------------
+        if resource_type.startswith((
+            "azurerm_application_gateway",
+            "azurerm_lb",
+        )):
+            if re.search(
+                r"(?mi)^\s*public_ip_address_id\s*=",
+                planned,
+            ):
+                findings.append(
+                    f"Azure exposure observation: {address} references "
+                    "a public frontend IP."
+                )
+
+        # ----------------------------------------------------
+        # Cost awareness
+        # ----------------------------------------------------
+        if (
+            action in {
+                "create",
+                "update",
+                "replace",
+            }
+            and _terraform_azure_cost_bearing(
+                resource_type
+            )
+        ):
+            cost_resources.append(address)
+
+    return {
+        "resource_count": resource_count,
+        "categories": {
+            name: count
+            for name, count in categories.items()
+            if count
+        },
+        "findings": list(
+            dict.fromkeys(findings)
+        )[:16],
+        "cost_resources": list(
+            dict.fromkeys(cost_resources)
+        )[:8],
+    }
+
+
 def analyze_terraform_plan(output: str) -> dict[str, object]:
     """Extract bounded, provider-aware intelligence from Terraform plan text."""
 
@@ -4114,6 +4646,10 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
         changes,
         sections,
     )
+    azure = _analyze_terraform_azure(
+        changes,
+        sections,
+    )
 
     return {
         "no_changes": no_changes,
@@ -4123,6 +4659,7 @@ def analyze_terraform_plan(output: str) -> dict[str, object]:
         "replacements": replacements,
         "destructive": destructive,
         "aws": aws,
+        "azure": azure,
     }
 
 
@@ -4138,6 +4675,7 @@ def summarize_terraform_plan(output: str) -> list[str]:
     replacements = int(analysis["replacements"])
     destructive = bool(analysis["destructive"])
     aws = analysis.get("aws")
+    azure = analysis.get("azure")
 
     summary: list[str] = []
 
@@ -4228,6 +4766,74 @@ def summarize_terraform_plan(output: str) -> list[str]:
                 )
                 + ". No dollar estimate is made without current "
                 "pricing and account context."
+            )
+
+    if (
+        isinstance(azure, dict)
+        and azure.get("resource_count")
+    ):
+        categories = azure.get(
+            "categories",
+            {},
+        )
+
+        category_labels = {
+            "compute": "compute",
+            "containers": "containers",
+            "networking": "networking",
+            "security": "security",
+            "load_balancing": "load-balancing",
+            "database": "database",
+            "storage": "storage",
+            "secrets": "secrets",
+            "identity": "identity",
+            "other": "other",
+        }
+
+        if isinstance(categories, dict):
+            rendered_categories = ", ".join(
+                f"{category_labels.get(name, name)}={count}"
+                for name, count in categories.items()
+            )
+
+            if rendered_categories:
+                summary.append(
+                    "Azure Terraform intelligence: planned resource "
+                    "activity by family: "
+                    + rendered_categories
+                    + "."
+                )
+
+        findings = azure.get(
+            "findings",
+            [],
+        )
+
+        if isinstance(findings, list):
+            summary.extend(
+                str(item)
+                for item in findings[:16]
+            )
+
+        cost_resources = azure.get(
+            "cost_resources",
+            [],
+        )
+
+        if (
+            isinstance(cost_resources, list)
+            and cost_resources
+        ):
+            summary.append(
+                "Azure cost awareness: planned create/update/replace "
+                "activity touches commonly billable Azure resource "
+                "classes: "
+                + ", ".join(
+                    str(item)
+                    for item in cost_resources[:8]
+                )
+                + ". No dollar estimate is made without current "
+                "pricing, region, SKU, and subscription context."
             )
 
     action_labels = {
