@@ -47,6 +47,7 @@ from iceman.application_remediation import (
     ApplicationRemediationAdvice,
     execute_application_change,
 )
+from iceman.terraform_remediation import TerraformRemediationAdvice
 from iceman.runner import CommandBlockedError, run_command, run_command_streaming
 from iceman.safety import check_command
 
@@ -983,6 +984,73 @@ def show_root_cause_investigation(
         "reachability/status probes and makes no system changes.[/dim]"
     )
 
+
+
+def show_terraform_remediation_advice(
+    advice: TerraformRemediationAdvice,
+) -> None:
+    console.print()
+    provider_text = (
+        ", ".join(advice.providers)
+        if advice.providers
+        else "provider not established"
+    )
+    console.print(
+        Panel.fit(
+            "[bold]Terraform Remediation Intelligence[/bold]\n"
+            f"Providers: [cyan]{provider_text}[/cyan]\n"
+            f"Plan: {advice.plan_summary}",
+            border_style="yellow",
+        )
+    )
+
+    if advice.destructive:
+        console.print(
+            "[bold red]Destructive/replacement activity detected.[/bold red]"
+        )
+
+    if advice.options:
+        console.print("\n[bold]Recommendations[/bold]")
+
+        for option in advice.options:
+            risk_style = {
+                "high": "red",
+                "medium": "yellow",
+                "low": "cyan",
+            }.get(option.risk, "yellow")
+
+            console.print(
+                f"  [bold]{option.number}. {option.title}[/bold]"
+            )
+            console.print(
+                f"     Risk: [{risk_style}]{option.risk}[/{risk_style}] "
+                "· manual/advisory only"
+            )
+            console.print(
+                f"     [dim]Provider: {option.provider} · "
+                f"Resource: {option.resource}[/dim]"
+            )
+            console.print(
+                f"     [bold]Evidence:[/bold] {option.finding}"
+            )
+            console.print(
+                f"     [bold]Direction:[/bold] {option.recommendation}"
+            )
+            if option.requires:
+                console.print(
+                    f"     [dim]Requires: {option.requires}[/dim]"
+                )
+            if option.note:
+                console.print(
+                    f"     [dim]{option.note}[/dim]"
+                )
+    else:
+        console.print(
+            "\n[green]No bounded provider-specific remediation "
+            "recommendations were established from the analyzed plan.[/green]"
+        )
+
+    console.print(f"\n[dim]{advice.note}[/dim]")
 
 
 def show_application_remediation_advice(

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
         WorkspaceFilePlan,
     )
     from iceman.devops_actions import DevOpsExecutionResult, DevOpsPlan
+    from iceman.terraform_remediation import TerraformRemediationAdvice
 
 
 @dataclass
@@ -44,6 +45,7 @@ class SessionState:
     last_workspace_file_apply: WorkspaceFileApplyResult | None = None
     last_devops_plan: DevOpsPlan | None = None
     last_devops_result: DevOpsExecutionResult | None = None
+    last_terraform_remediation: TerraformRemediationAdvice | None = None
     last_devops_component: str | None = None
     last_devops_image: str | None = None
     last_target: str | None = None
@@ -250,6 +252,20 @@ class SessionState:
             ),
         )
 
+    def remember_terraform_remediation(
+        self,
+        advice: TerraformRemediationAdvice,
+    ) -> None:
+        self.last_terraform_remediation = advice
+        self.add_event(
+            "terraform_remediation",
+            (
+                f"providers={','.join(advice.providers) or 'none'}; "
+                f"options={len(advice.options)}; "
+                f"destructive={advice.destructive}"
+            ),
+        )
+
     def remember_application_change(
         self,
         plan: ApplicationChangePlan,
@@ -262,6 +278,59 @@ class SessionState:
                 f"safe_to_apply={plan.safe_to_apply}"
             ),
         )
+
+    def latest_remediation_context(self) -> str | None:
+        from iceman.devops_actions import DevOpsAction
+
+        terraform_actions = {
+            DevOpsAction.TERRAFORM_PLAN,
+            DevOpsAction.TERRAFORM_EXPLAIN_PLAN,
+        }
+
+        current_terraform_result = (
+            self.last_devops_result is not None
+            and self.last_devops_result.plan.request.action
+            in terraform_actions
+        )
+
+        for event in reversed(self.history):
+            if event.kind == "terraform_remediation":
+                if (
+                    current_terraform_result
+                    or self.last_terraform_remediation is not None
+                ):
+                    return "terraform"
+
+            if (
+                event.kind == "devops_action"
+                and (
+                    event.summary.startswith(
+                        DevOpsAction.TERRAFORM_PLAN.value + ":"
+                    )
+                    or event.summary.startswith(
+                        DevOpsAction.TERRAFORM_EXPLAIN_PLAN.value + ":"
+                    )
+                )
+            ):
+                if current_terraform_result:
+                    return "terraform"
+
+            if event.kind == "investigation":
+                return "investigation"
+
+            if event.kind == "diagnosis":
+                return "diagnosis"
+
+        if current_terraform_result:
+            return "terraform"
+
+        if self.last_investigation is not None:
+            return "investigation"
+
+        if self.last_diagnosis is not None:
+            return "diagnosis"
+
+        return None
 
     def latest_problem_context(self) -> str | None:
         for event in reversed(self.history):

@@ -15,6 +15,7 @@ from iceman.inspector import inspect_project
 from iceman.planner import make_plan
 from iceman.reasoner import explain_context
 from iceman.remediation import build_remediation_plan
+from iceman.terraform_remediation import build_terraform_remediation_advice
 from iceman.application_remediation import (
     build_application_remediation_advice,
     prepare_application_change_plan,
@@ -47,6 +48,7 @@ from iceman.presentation import (
     show_ai_provider_status,
     show_application_change_plan,
     show_application_remediation_advice,
+    show_terraform_remediation_advice,
     show_ai_route,
     show_doctor,
     show_docker_diagnosis,
@@ -332,6 +334,81 @@ def _run_investigate_remediation_option(
     )
 
 
+def _latest_terraform_plan_output(
+    state: SessionState,
+) -> str | None:
+    result = state.last_devops_result
+    if result is None or not result.success:
+        return None
+
+    if result.plan.request.action not in {
+        DevOpsAction.TERRAFORM_PLAN,
+        DevOpsAction.TERRAFORM_EXPLAIN_PLAN,
+    }:
+        return None
+
+    chunks: list[str] = []
+
+    for step_result in result.step_results:
+        if step_result.result.stdout:
+            chunks.append(step_result.result.stdout)
+
+        if step_result.result.stderr:
+            chunks.append(step_result.result.stderr)
+
+    return "\n".join(chunks).strip() or None
+
+
+def _run_terraform_remediation_advice(
+    state: SessionState,
+) -> None:
+    plan_output = _latest_terraform_plan_output(
+        state
+    )
+
+    if plan_output is None:
+        if state.last_terraform_remediation is not None:
+            show_terraform_remediation_advice(
+                state.last_terraform_remediation
+            )
+            return
+
+        console.print(
+            "[yellow]No successful Terraform plan analysis is in "
+            "context yet. Run 'analyze terraform plan' first.[/yellow]"
+        )
+        return
+
+    advice = build_terraform_remediation_advice(
+        plan_output
+    )
+    state.remember_terraform_remediation(advice)
+    show_terraform_remediation_advice(advice)
+
+
+def _run_remediation_advice(
+    state: SessionState,
+) -> None:
+    context = state.latest_remediation_context()
+
+    if context == "terraform":
+        _run_terraform_remediation_advice(state)
+        return
+
+    if context == "investigation":
+        _run_application_remediation_advice(state)
+        return
+
+    if context == "diagnosis":
+        _run_repair(state)
+        return
+
+    console.print(
+        "[yellow]No Terraform plan, root-cause investigation, or "
+        "Docker diagnosis is in remediation context yet.[/yellow]"
+    )
+
+
 def _run_application_remediation_advice(
     state: SessionState,
 ) -> None:
@@ -354,6 +431,14 @@ def _run_application_option(
     replacement_url: str | None,
     state: SessionState,
 ) -> None:
+    if state.latest_remediation_context() == "terraform":
+        console.print(
+            "[yellow]Terraform remediation options are advisory-only. "
+            "Iceman will not convert 'apply option' into an HCL write, "
+            "terraform apply, or terraform destroy operation.[/yellow]"
+        )
+        return
+
     if state.last_investigation is None:
         console.print(
             "[yellow]No root-cause investigation is in context. "
@@ -396,7 +481,13 @@ def _run_application_option(
 
 
 def _run_repair(state: SessionState) -> None:
-    if state.latest_problem_context() == "investigation":
+    remediation_context = state.latest_remediation_context()
+
+    if remediation_context == "terraform":
+        _run_terraform_remediation_advice(state)
+        return
+
+    if remediation_context == "investigation":
         _run_application_remediation_advice(state)
         return
 
@@ -767,7 +858,7 @@ def _dispatch_trusted_intent(
         return True
 
     if action == TrustedAction.RECOMMEND_REMEDIATION:
-        _run_application_remediation_advice(state)
+        _run_remediation_advice(state)
         return True
 
     if action == TrustedAction.ANALYZE_HTTP_CONTEXT:
@@ -1023,7 +1114,7 @@ def start_shell(project_path: Path | None = None) -> None:
             "recommend a fix",
             "recommend remediation",
         }:
-            _run_application_remediation_advice(state)
+            _run_remediation_advice(state)
             continue
 
         if lowered in {

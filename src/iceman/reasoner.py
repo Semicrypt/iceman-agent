@@ -943,6 +943,9 @@ _REMEDIATION_RECOMMEND_PHRASES = (
     "recommend a fix",
     "recommend remediation",
     "what should i do about it",
+    "how should i fix the terraform issues",
+    "what should i fix in this terraform plan",
+    "recommend terraform remediation",
 )
 
 
@@ -1075,8 +1078,9 @@ def reason_request(prompt: str, state: SessionState) -> ReasoningDecision:
         return ReasoningDecision(
             ReasoningAction.RECOMMEND_REMEDIATION,
             (
-                "Use the latest root-cause evidence to recommend bounded "
-                "remediation options without making changes."
+                "Use the latest supported remediation context to recommend "
+                "bounded options without making changes. Terraform advice "
+                "must remain advisory-only and must never become apply/destroy."
             ),
         )
 
