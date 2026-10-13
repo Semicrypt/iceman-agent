@@ -562,8 +562,25 @@ def _extract_devops_action_request(
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Create a read-only Terraform plan; do not apply changes.", devops_action=DevOpsAction.TERRAFORM_PLAN)
     if "terraform" in lower and "plan" in lower and any(word in lower for word in {"fail", "failing", "failed", "error", "broken", "wrong"}):
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Re-run the read-only Terraform plan so Iceman can surface the current planning failure.", devops_action=DevOpsAction.TERRAFORM_PLAN)
-    if lower in {"explain terraform plan", "explain the terraform plan", "explain what terraform will create"}:
-        return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Create and summarize a read-only Terraform plan.", devops_action=DevOpsAction.TERRAFORM_EXPLAIN_PLAN)
+    if lower in {
+        "explain terraform plan",
+        "explain the terraform plan",
+        "explain what terraform will create",
+        "analyze terraform plan",
+        "analyze the terraform plan",
+        "review terraform plan",
+        "review the terraform plan",
+        "explain what terraform will change",
+        "show terraform plan intelligence",
+    }:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            (
+                "Create and analyze a read-only Terraform plan with bounded "
+                "provider, resource-action, replacement, and destructive-change intelligence."
+            ),
+            devops_action=DevOpsAction.TERRAFORM_EXPLAIN_PLAN,
+        )
     if lower in {"show terraform state", "list terraform state", "show terraform resources"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "List Terraform state resources.", devops_action=DevOpsAction.TERRAFORM_STATE)
 

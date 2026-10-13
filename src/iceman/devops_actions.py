@@ -3507,19 +3507,192 @@ def reason_k8s_pod_execution(
     return diagnosis, evidence, next_actions
 
 
-def summarize_terraform_plan(output: str) -> list[str]:
-    if "No changes." in output or "No changes. Your infrastructure matches" in output:
-        return ["Terraform reports no infrastructure changes."]
-    match = re.search(
+_TERRAFORM_CHANGE_HEADER = re.compile(
+    r"(?m)^\s*#\s+(\S+)\s+"
+    r"(will be created|will be updated in-place|will be destroyed|"
+    r"must be replaced|will be read during apply)\s*$"
+)
+
+
+def _terraform_provider_for_address(address: str) -> str:
+    """Classify a Terraform resource address without requiring provider APIs."""
+
+    tokens = re.findall(
+        r"(?:^|\.)([A-Za-z][A-Za-z0-9_]+)(?=\.)",
+        address,
+    )
+
+    resource_type = ""
+    for token in tokens:
+        if token == "module" or token == "data":
+            continue
+        if "_" in token:
+            resource_type = token
+            break
+
+    if resource_type.startswith("aws_"):
+        return "AWS"
+    if resource_type.startswith("azurerm_"):
+        return "AzureRM"
+    if resource_type.startswith("azuread_"):
+        return "AzureAD"
+    if resource_type.startswith("google_"):
+        return "Google Cloud"
+    if resource_type.startswith("kubernetes_"):
+        return "Kubernetes"
+    if resource_type.startswith("helm_"):
+        return "Helm"
+
+    return "Other"
+
+
+def analyze_terraform_plan(output: str) -> dict[str, object]:
+    """Extract bounded, provider-aware intelligence from Terraform plan text."""
+
+    no_changes = (
+        "No changes." in output
+        or "No changes. Your infrastructure matches" in output
+    )
+
+    totals = {
+        "add": 0,
+        "change": 0,
+        "destroy": 0,
+    }
+
+    plan_match = re.search(
         r"Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy",
         output,
     )
-    if match:
-        add, change, destroy = map(int, match.groups())
-        return [
-            f"Terraform plan summary: {add} to add, {change} to change, {destroy} to destroy."
-        ]
-    return []
+    if plan_match:
+        totals["add"], totals["change"], totals["destroy"] = map(
+            int,
+            plan_match.groups(),
+        )
+
+    action_map = {
+        "will be created": "create",
+        "will be updated in-place": "update",
+        "will be destroyed": "destroy",
+        "must be replaced": "replace",
+        "will be read during apply": "read",
+    }
+
+    changes: list[dict[str, str]] = []
+    providers: list[str] = []
+
+    for match in _TERRAFORM_CHANGE_HEADER.finditer(output):
+        address = match.group(1).strip()
+        action = action_map[match.group(2)]
+        provider = _terraform_provider_for_address(address)
+
+        changes.append({
+            "address": address,
+            "action": action,
+            "provider": provider,
+        })
+
+        if provider not in providers:
+            providers.append(provider)
+
+    actionable = [
+        item for item in changes
+        if item["action"] != "read"
+    ]
+
+    replacements = sum(
+        1 for item in actionable
+        if item["action"] == "replace"
+    )
+    explicit_destroys = sum(
+        1 for item in actionable
+        if item["action"] == "destroy"
+    )
+
+    destructive = (
+        totals["destroy"] > 0
+        or replacements > 0
+        or explicit_destroys > 0
+    )
+
+    return {
+        "no_changes": no_changes,
+        "totals": totals,
+        "changes": changes,
+        "providers": providers,
+        "replacements": replacements,
+        "destructive": destructive,
+    }
+
+
+def summarize_terraform_plan(output: str) -> list[str]:
+    analysis = analyze_terraform_plan(output)
+
+    if analysis["no_changes"]:
+        return ["Terraform reports no infrastructure changes."]
+
+    totals = analysis["totals"]
+    changes = analysis["changes"]
+    providers = analysis["providers"]
+    replacements = int(analysis["replacements"])
+    destructive = bool(analysis["destructive"])
+
+    summary: list[str] = []
+
+    if any(totals.values()):
+        summary.append(
+            "Terraform plan summary: "
+            f"{totals['add']} to add, "
+            f"{totals['change']} to change, "
+            f"{totals['destroy']} to destroy."
+        )
+
+    if providers:
+        summary.append(
+            "Terraform providers detected in planned resource activity: "
+            + ", ".join(providers)
+            + "."
+        )
+
+    if replacements:
+        summary.append(
+            f"Terraform replacement warning: {replacements} resource(s) "
+            "must be replaced; replacement includes destruction of the "
+            "existing object."
+        )
+
+    if destructive:
+        summary.append(
+            "Terraform destructive-change warning: this plan contains "
+            "resource destruction or replacement. Iceman will not apply "
+            "or destroy infrastructure automatically."
+        )
+
+    action_labels = {
+        "create": "CREATE",
+        "update": "UPDATE",
+        "destroy": "DESTROY",
+        "replace": "REPLACE",
+        "read": "READ",
+    }
+
+    bounded_changes = changes[:12]
+    for item in bounded_changes:
+        summary.append(
+            "Terraform resource: "
+            f"{action_labels[item['action']]} "
+            f"{item['address']} "
+            f"[{item['provider']}]."
+        )
+
+    remaining = len(changes) - len(bounded_changes)
+    if remaining > 0:
+        summary.append(
+            f"Terraform resource detail bounded: {remaining} additional "
+            "planned resource action(s) not individually displayed."
+        )
+
+    return summary
 
 
 
