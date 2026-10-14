@@ -1707,3 +1707,58 @@ Developer validation for this redesign includes `tests/test_conversational_route
 `tests/test_git_compound_workflow.py`, and `tests/test_cli_live_conversation.py`.
 The live tests use the installed global `ice` in temporary directories and only
 push to a disposable local bare remote.
+
+## Agent Iceman Linux package automation
+
+The `Agent Iceman Linux packages` workflow builds test artifacts on an Ubuntu
+22.04 AMD64 runner using Python 3.12. It runs on branch pushes, pull requests,
+and manual dispatch. It does not create a GitHub Release, publish to PyPI,
+or write to the repository.
+
+The `agent-iceman-linux-amd64-ci` artifact contains:
+
+- The `agent_iceman-<version>-py3-none-any.whl` Python wheel.
+- The standalone Linux AMD64 `ice` executable (no Python installation needed).
+- `agent-iceman_<version>-1_amd64.deb`, installing `/opt/agent-iceman/ice`
+  and both `/usr/bin/ice` and `/usr/bin/iceman` aliases.
+- `SHA256SUMS` for all three files.
+
+The workflow uses `AGENT_ICEMAN_MAINTAINER=Agent Iceman CI <ci@example.invalid>`
+only for CI artifacts. That address is intentionally invalid; these artifacts
+are for testing, not public release. Artifacts are retained for 14 days. Wait for
+all compatibility jobs to pass before treating a build as verified.
+
+The same Ubuntu 22.04 artifacts are checked on native Ubuntu 22.04, 24.04, and
+26.04 runners. Each job verifies checksums, installs the wheel in a clean virtual
+environment, and tests the standalone executable and both installed command
+aliases. CLI checks run as the runner user with networking disabled, a temporary
+home and project directory, local reasoning, and offline knowledge. The `.deb`
+is installed and removed only on these disposable GitHub-hosted runners; failed
+checks also trigger removal. The separate existing CI workflow runs the full
+application test suite.
+
+After downloading and extracting the artifact, verify it before use:
+
+```bash
+sha256sum --check --strict SHA256SUMS
+chmod +x ice
+./ice --version
+```
+
+GitHub artifact ZIPs do not preserve executable permissions, hence `chmod`.
+The external package name remains **Agent Iceman**, while the internal module,
+CLI identity, and commands remain **Iceman**, `ice`, and `iceman`.
+
+For a manual build, run `bash scripts/build_linux.sh` on Linux AMD64 with Python
+3.10 or newer (3.12 recommended), venv support, binutils, and dpkg tools. Set
+`AGENT_ICEMAN_MAINTAINER` to the real maintainer's `Name <email>` first; there is
+no default contact. The script downloads Python build dependencies, uses a
+temporary virtual environment, and never installs a system package or invokes
+Docker. The optional first argument selects an output directory (default:
+`dist/linux`), which must be empty so older artifacts are not mixed or erased.
+Only stable numeric project versions are currently supported.
+
+Build on Ubuntu 22.04 for the CI compatibility baseline. PyInstaller does not
+bundle glibc; a build made on a newer host is not an Ubuntu 22.04 build. The
+Debian dependency records the builder's glibc version. Compatibility with other
+Linux distributions or architectures is not established by this workflow.
