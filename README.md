@@ -1762,3 +1762,11 @@ Build on Ubuntu 22.04 for the CI compatibility baseline. PyInstaller does not
 bundle glibc; a build made on a newer host is not an Ubuntu 22.04 build. The
 Debian dependency records the builder's glibc version. Compatibility with other
 Linux distributions or architectures is not established by this workflow.
+
+## License
+
+Agent Iceman is licensed under the **Apache License, Version 2.0**.
+
+See the [LICENSE](LICENSE) file for the complete license terms.
+
+Copyright and attribution notices are retained by their respective owners.
