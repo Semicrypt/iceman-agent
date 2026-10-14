@@ -287,9 +287,87 @@ def candidates_for_linux_path(
     # be introducing a new path.
     if action in {LinuxAction.MAKE_DIR, LinuxAction.CREATE_FILE}:
         return EntityResolution(original=original, kind="path")
+
+    # Explicit paths are handled by the normal workspace/path-safety layer.
+    # Do not fuzzy-rewrite path components.
     if "/" in original or original in {".", ".."}:
         return EntityResolution(original=original, kind="path")
-    return resolve_entity(original, _workspace_names(workspace), kind="workspace path")
+
+    value = original.strip()
+    folded = value.casefold()
+    names = _workspace_names(workspace)
+
+    # First prefer an exact name ignoring case. This safely resolves things like
+    # `dockerfile` -> `Dockerfile` only when the workspace contains one unique
+    # match. A case-sensitive filesystem can legally contain both variants, so
+    # multiple matches must remain ambiguous.
+    exact_matches = [
+        name for name in names
+        if name.casefold() == folded
+    ]
+
+    if len(exact_matches) == 1:
+        resolved = exact_matches[0]
+        return EntityResolution(
+            original=original,
+            kind="workspace path",
+            resolved=resolved,
+            confidence="high",
+        )
+
+    if len(exact_matches) > 1:
+        return EntityResolution(
+            original=original,
+            kind="workspace path",
+            candidates=tuple(exact_matches[:5]),
+            confidence="high",
+        )
+
+    # Extension-aware shorthand is deliberately limited to top-level files and
+    # only when the user supplied a bare filename token. For example:
+    #
+    #   readme -> README.md
+    #
+    # If README.md and README.txt both exist, refuse to guess.
+    if not Path(value).suffix:
+        try:
+            excluded = {".git", ".terraform", "node_modules", ".venv"}
+            file_names = sorted(
+                item.name
+                for item in workspace.iterdir()
+                if item.name not in excluded and item.is_file()
+            )
+        except OSError:
+            file_names = []
+
+        stem_matches = [
+            name for name in file_names
+            if Path(name).stem.casefold() == folded
+        ]
+
+        if len(stem_matches) == 1:
+            return EntityResolution(
+                original=original,
+                kind="workspace file",
+                resolved=stem_matches[0],
+                confidence="high",
+            )
+
+        if len(stem_matches) > 1:
+            return EntityResolution(
+                original=original,
+                kind="workspace file",
+                candidates=tuple(stem_matches[:5]),
+                confidence="high",
+            )
+
+    # Fall back to the existing bounded entity matcher for ordinary typo/fuzzy
+    # handling. It still operates only on real entries in the current workspace.
+    return resolve_entity(
+        original,
+        names,
+        kind="workspace path",
+    )
 
 
 def candidates_for_image(workspace: Path, original: str) -> EntityResolution:

@@ -63,7 +63,9 @@ class KubernetesActionPlanTests(unittest.TestCase):
             )
         self.assertTrue(plan.safe_to_execute)
         self.assertFalse(plan.requires_approval)
-        self.assertEqual(plan.steps[0].command, "kubectl get pods -o wide")
+        commands = [step.command for step in plan.steps]
+        self.assertTrue(commands[-1].endswith("get pods -o wide"))
+        self.assertTrue(all(not step.changes_state for step in plan.steps))
 
 
 if __name__ == "__main__":

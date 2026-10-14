@@ -251,6 +251,12 @@ def advise_linux_plan(plan: LinuxPlan) -> AdvisorReport:
             AdviceLevel.REMINDER,
             "The source and destination are both constrained to the active workspace for file-changing operations.",
         ))
+    if plan.request.action == LinuxAction.DELETE_FILE:
+        findings.append(Advisory(
+            AdviceLevel.WARNING,
+            "This operation permanently removes the exact file shown in the plan.",
+            "Iceman permits only a single workspace-bounded file deletion here; recursive rm -rf deletion is not exposed.",
+        ))
     return AdvisorReport(findings=findings)
 
 
