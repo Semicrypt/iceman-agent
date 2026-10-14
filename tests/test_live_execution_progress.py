@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,7 @@ class StreamingRunnerTests(unittest.TestCase):
     def test_streams_stdout_and_stderr_and_captures_them(self):
         events = []
         command = (
-            "python -c 'import sys; print(\"out\", flush=True); "
+            f"{sys.executable} -c 'import sys; print(\"out\", flush=True); "
             "print(\"err\", file=sys.stderr, flush=True)'"
         )
         result = run_command_streaming(
@@ -42,7 +43,7 @@ class StreamingRunnerTests(unittest.TestCase):
     def test_emits_heartbeat_for_silent_process(self):
         heartbeats = []
         result = run_command_streaming(
-            "python -c 'import time; time.sleep(0.16); print(\"done\")'",
+            f"{sys.executable} -c 'import time; time.sleep(0.16); print(\"done\")'",
             on_heartbeat=lambda elapsed, silent: heartbeats.append((elapsed, silent)),
             heartbeat_interval=0.04,
         )

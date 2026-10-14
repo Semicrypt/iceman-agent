@@ -20,7 +20,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(state.last_target, "demo")
         self.assertTrue(state.history)
 
-    def test_workspace_change_clears_assessment_only(self):
+    def test_workspace_change_clears_workspace_bound_context(self):
         state = SessionState(Path("."))
         old_diagnosis = DockerDiagnosis(
             target="demo",
@@ -31,7 +31,8 @@ class SessionTests(unittest.TestCase):
         state.change_workspace(Path("/tmp"))
 
         self.assertEqual(state.workspace, Path("/tmp"))
-        self.assertIs(state.last_diagnosis, old_diagnosis)
+        self.assertIsNone(state.last_diagnosis)
+        self.assertIsNone(state.last_target)
 
 
 if __name__ == "__main__":

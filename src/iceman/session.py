@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from iceman.assessment import ProjectAssessment
+    from iceman.project_advisor import ProjectAssessment as ProjectReview
     from iceman.diagnostics import DockerDiagnosis
     from iceman.remediation import RemediationPlan
     from iceman.probing import (
@@ -37,6 +38,7 @@ class SessionState:
     last_diagnosis: DockerDiagnosis | None = None
     last_remediation: RemediationPlan | None = None
     last_assessment: ProjectAssessment | None = None
+    last_project_review: ProjectReview | None = None
     last_investigation: RootCauseInvestigation | None = None
     last_application_remediation: ApplicationRemediationAdvice | None = None
     last_application_change: ApplicationChangePlan | None = None
@@ -59,13 +61,19 @@ class SessionState:
         self.workspace = self.workspace.resolve()
 
     def add_event(self, kind: str, summary: str) -> None:
-        self.history.append(SessionEvent(kind=kind, summary=summary))
+        from iceman.redaction import redact_text
+
+        self.history.append(SessionEvent(kind=kind, summary=redact_text(summary)))
         if len(self.history) > 30:
             self.history = self.history[-30:]
 
     def change_workspace(self, workspace: Path) -> None:
-        self.workspace = workspace.resolve()
-        self.last_assessment = None
+        resolved = workspace.resolve()
+        if resolved == self.workspace:
+            return
+        # Every remembered target/plan is scoped to its original workspace.
+        # Retaining it could apply a follow-up to an unrelated project.
+        self.__dict__.update(SessionState(resolved).__dict__)
         self.add_event("workspace", f"Workspace changed to {self.workspace}")
 
     def remember_diagnosis(self, diagnosis: DockerDiagnosis) -> None:

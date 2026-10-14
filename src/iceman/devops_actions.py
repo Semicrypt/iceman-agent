@@ -33,6 +33,7 @@ class DevOpsAction(str, Enum):
 
     K8S_CONTEXT = "k8s_context"
     K8S_CONTEXTS = "k8s_contexts"
+    K8S_MINIKUBE_START = "k8s_minikube_start"
     K8S_NAMESPACES = "k8s_namespaces"
     K8S_VALIDATE = "k8s_validate"
     K8S_DEPLOY = "k8s_deploy"
@@ -934,6 +935,41 @@ def _current_k8s_context(workspace: Path) -> str | None:
     return result.stdout.strip() or None
 
 
+def _minikube_appears_running(workspace: Path) -> bool | None:
+    """Return Minikube API-server state without changing the cluster."""
+    try:
+        result = run_command("minikube status", cwd=workspace)
+    except (FileNotFoundError, OSError):
+        return None
+
+    text = "\n".join(
+        part for part in (result.stdout, result.stderr) if part
+    ).lower()
+
+    if (
+        result.returncode == 0
+        and (
+            "apiserver: running" in text
+            or "apiserver:running" in text
+        )
+    ):
+        return True
+
+    stopped_markers = (
+        "apiserver: stopped",
+        "host: stopped",
+        "kubelet: stopped",
+        "does not exist",
+        "nonexistent",
+        "not running",
+    )
+
+    if result.returncode != 0 or any(marker in text for marker in stopped_markers):
+        return False
+
+    return None
+
+
 def _available_k8s_contexts(workspace: Path) -> list[str]:
     """Return kubeconfig context names without changing the active context."""
     try:
@@ -1618,6 +1654,37 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
         elif action == DevOpsAction.K8S_CONTEXTS:
             plan.steps.append(DevOpsStep("List Kubernetes contexts", "kubectl config get-contexts"))
 
+        elif action == DevOpsAction.K8S_MINIKUBE_START:
+            plan.steps.append(
+                DevOpsStep(
+                    "Start Minikube cluster",
+                    "minikube start",
+                    changes_state=True,
+                )
+            )
+            plan.steps.append(
+                DevOpsStep(
+                    "Verify Minikube status",
+                    "minikube status",
+                )
+            )
+            plan.steps.append(
+                DevOpsStep(
+                    "Show current Kubernetes context",
+                    "kubectl config current-context",
+                )
+            )
+            plan.steps.append(
+                DevOpsStep(
+                    "Verify Kubernetes API connectivity",
+                    "kubectl --request-timeout=5s cluster-info",
+                )
+            )
+            plan.notes.append(
+                "This workflow starts or resumes the local Minikube cluster, "
+                "then verifies its status and Kubernetes API connectivity."
+            )
+
         elif action == DevOpsAction.K8S_VALIDATE:
             directory = _k8s_dir(workspace)
             plan.steps.append(
@@ -1741,7 +1808,37 @@ def build_devops_plan(workspace: Path, request: DevOpsRequest) -> DevOpsPlan:
             plan.steps.append(DevOpsStep("Show services", f"{scoped} get svc"))
 
         elif action == DevOpsAction.K8S_PODS:
-            plan.steps.append(DevOpsStep("Show Kubernetes pods", "kubectl get pods -o wide"))
+            current_context = _current_k8s_context(workspace)
+
+            if current_context:
+                scoped = f"kubectl --context {_quote(current_context)}"
+                plan.target_context = current_context
+                plan.context_inferred = True
+            else:
+                scoped = "kubectl"
+
+            if current_context == "minikube":
+                plan.steps.append(
+                    DevOpsStep(
+                        "Check Minikube status",
+                        "minikube status",
+                    )
+                )
+                plan.notes.append(
+                    "The active context is Minikube, so Iceman checks the local "
+                    "cluster first. If it is stopped, run: ice start minikube"
+                )
+
+            plan.steps.append(
+                DevOpsStep(
+                    "Show Kubernetes pods",
+                    f"{scoped} --request-timeout=5s get pods -o wide",
+                )
+            )
+            plan.notes.append(
+                "Kubernetes API requests are bounded with a 5-second request "
+                "timeout so an unreachable cluster fails quickly."
+            )
 
         elif action == DevOpsAction.K8S_DIAGNOSE_POD:
             pod = _safe_name(component, field_name="pod")

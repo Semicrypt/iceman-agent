@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import os
+import stat
 import shlex
 import shutil
 import time
@@ -58,6 +61,7 @@ class GitPlan:
     large_paths: list[str] = field(default_factory=list)
     branch: str | None = None
     remote: str | None = None
+    preflight_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +227,108 @@ def _validate_visibility(value: str | None) -> str:
     return normalized
 
 
+
+def _compound_paths(workspace: Path) -> list[str]:
+    result = _run(workspace, "git status --porcelain=v1 -z --untracked-files=all")
+    if result is None or result.returncode != 0:
+        raise ValueError("I could not inspect all repository changes safely.")
+    records = result.stdout.split("\0")
+    paths: set[str] = set()
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 4 or record[2] != " ":
+            raise ValueError("Git returned an unreadable change list; no changes will be staged.")
+        code, path = record[:2], record[3:]
+        if code in {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}:
+            raise ValueError("Resolve the current Git merge conflicts before committing and pushing.")
+        paths.add(path)
+        if "R" in code or "C" in code:
+            if index >= len(records) or not records[index]:
+                raise ValueError("Git returned an incomplete rename or copy entry.")
+            paths.add(records[index])
+            index += 1
+        if len(paths) > 1000:
+            raise ValueError("This workflow covers more than 1000 paths; split it into smaller reviewed changes.")
+    return sorted(paths)
+
+
+def _compound_file_digest(workspace: Path, rel: str, *, scan: bool) -> str:
+    root = workspace.resolve()
+    relative = Path(rel)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("A changed path is outside the approved repository.")
+    if not hasattr(os, "O_NOFOLLOW") or os.open not in os.supports_dir_fd:
+        raise ValueError("Safe file inspection is unavailable on this platform.")
+    # Open each component relative to an anchored directory descriptor. This
+    # refuses symlinks even if a path changes between listing and inspection.
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in relative.parts[:-1]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        try:
+            file_fd = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        except FileNotFoundError:
+            return "deleted"
+        except OSError as exc:
+            raise ValueError("Changed symbolic links or unreadable files need separate review before a combined commit and push.") from exc
+        try:
+            info = os.fstat(file_fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("Changed directories or submodules need separate review before a combined commit and push.")
+            if info.st_size >= 100 * 1024 * 1024:
+                raise ValueError("A changed file reaches the 100 MiB limit; review large files before committing.")
+            digest = hashlib.sha256()
+            digest.update(str(info.st_mode).encode("ascii"))
+            tail = ""
+            total = 0
+            while True:
+                block = os.read(file_fd, 128 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total >= 100 * 1024 * 1024:
+                    raise ValueError("A changed file grew beyond the inspection limit.")
+                digest.update(block)
+                if scan:
+                    content = tail + block.decode("utf-8", errors="ignore")
+                    if any(pattern.search(content) for pattern in _SECRET_PATTERNS):
+                        raise ValueError("A changed file contains a potential secret. Remove it before committing; its value has not been displayed.")
+                    tail = content[-4096:]
+            return digest.hexdigest()
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(descriptor)
+
+
+def _compound_fingerprint(workspace: Path, *, scan: bool = False) -> str:
+    digest = hashlib.sha256()
+    commands = (
+        "git status --porcelain=v1 -z --untracked-files=all",
+        "git diff --cached --binary",
+        "git rev-parse --verify HEAD",
+        "git branch --show-current",
+        "git config --get-regexp '^remote\\.origin\\.'",
+        "git remote get-url --push --all origin",
+    )
+    for command in commands:
+        result = _run(workspace, command)
+        if result is None or (result.returncode != 0 and command != "git rev-parse --verify HEAD"):
+            raise ValueError("Git preflight could not read repository state.")
+        digest.update((command + "\0" + str(result.returncode) + "\0" + result.stdout + "\0").encode("utf-8"))
+    try:
+        for rel in _compound_paths(workspace):
+            digest.update((rel + "\0" + _compound_file_digest(workspace, rel, scan=scan) + "\0").encode("utf-8"))
+    except OSError as exc:
+        raise ValueError("A changed path could not be inspected safely; nothing will be staged.") from exc
+    return digest.hexdigest()
+
 def build_git_plan(workspace: Path, request: GitRequest) -> GitPlan:
     workspace = workspace.resolve()
     plan = GitPlan(
@@ -350,39 +456,77 @@ def build_git_plan(workspace: Path, request: GitRequest) -> GitPlan:
         elif action == GitAction.COMMIT_PUSH:
             if not repo:
                 raise ValueError("This workspace is not a Git repository yet.")
-            message = _validate_message(request.message)
+            top = _run(workspace, "git rev-parse --show-toplevel")
+            if top is None or top.returncode != 0 or Path(top.stdout.strip()).resolve() != workspace.resolve():
+                raise ValueError("A combined stage, commit, and push covers the whole repository. Run it from the repository root so I can inspect and preview that full scope.")
+            _validate_message(request.message)
+            message = request.message
+            assert message is not None
+            if any(pattern.search(message) for pattern in _SECRET_PATTERNS):
+                raise ValueError("The commit message contains a potential secret; replace it before continuing.")
             branch = _branch(workspace)
             if not branch:
                 raise ValueError("Git is in detached HEAD state or has no current branch; Iceman will not push.")
-            remotes = _remote_names(workspace)
-            if "origin" not in remotes:
-                raise ValueError("No 'origin' remote is configured. Create/connect the GitHub repository first.")
-            changed = _status_paths(workspace)
+            if "origin" not in _remote_names(workspace):
+                raise ValueError("No 'origin' remote is configured. Connect a remote before committing and pushing.")
+            destination = _run(workspace, "git remote get-url --push --all origin")
+            urls = destination.stdout.strip().splitlines() if destination and destination.returncode == 0 else []
+            if len(urls) != 1 or urls[0].startswith("-") or "::" in urls[0]:
+                raise ValueError("This workflow requires one ordinary origin push destination; review the remote configuration.")
+            mirror = _run(workspace, "git config --bool --get remote.origin.mirror")
+            if mirror and mirror.returncode == 0 and mirror.stdout.strip() == "true":
+                raise ValueError("Origin is configured as a mirror; this workflow only publishes one branch.")
+            from urllib.parse import urlsplit
+            destination_parts = urlsplit(urls[0])
+            if destination_parts.password or (destination_parts.scheme in {"http", "https"} and destination_parts.username):
+                raise ValueError("Use Git credential management instead of embedding credentials in the remote URL.")
+            changed = _compound_paths(workspace)
             if not changed:
                 raise ValueError("There are no changes to commit.")
+            fingerprint = _compound_fingerprint(workspace, scan=True)
             plan.changed_paths = changed
-            sensitive, large, heavy = _scan_paths(workspace, changed)
+            plan.branch = branch
+            plan.remote = "origin"
+            # Strict descriptor-based content inspection above precedes the
+            # existing name/size/generated-file policy shared by Git actions.
+            sensitive = [p for p in changed if _is_sensitive_name(p)]
+            heavy = [p for p in changed if any(part + "/" in _HEAVY_PREFIXES for part in Path(p).parts)]
             plan.sensitive_paths = sensitive
-            plan.large_paths = large
-            if sensitive or large or heavy:
+            if sensitive or heavy:
                 plan.safe_to_execute = False
                 if sensitive:
-                    plan.notes.append("Potential secret/sensitive files detected: " + ", ".join(sensitive[:8]))
-                if large:
-                    plan.notes.append("Files at or above GitHub's 100 MiB limit detected: " + ", ".join(large[:8]))
+                    plan.notes.append("Potential secret/sensitive files detected; review them before staging.")
                 if heavy:
-                    plan.notes.append("Generated/heavy directories are not ignored: " + ", ".join(heavy[:8]))
-                plan.notes.append("Iceman will not stage/commit/push until the pre-commit blockers are resolved.")
+                    plan.notes.append("Generated/heavy directories are not ignored.")
+                plan.notes.append("No part of this workflow will execute until these blockers are resolved.")
             if plan.safe_to_execute:
-                upstream = _run(workspace, "git rev-parse --abbrev-ref --symbolic-full-name @{u}")
-                push_cmd = "git push" if upstream and upstream.returncode == 0 else f"git push -u origin {_quote(branch)}"
+                checks = (
+                    ("git diff --check", "Fix whitespace errors in the working tree before committing."),
+                    ("git diff --cached --check", "Fix whitespace errors in staged changes before committing."),
+                    ("git var GIT_AUTHOR_IDENT", "Configure a valid Git author identity before committing."),
+                    ("git var GIT_COMMITTER_IDENT", "Configure a valid Git committer identity before committing."),
+                )
+                for command, problem in checks:
+                    check = _run(workspace, command)
+                    if check is None or check.returncode != 0:
+                        raise ValueError(problem)
+                plan.preflight_fingerprint = fingerprint
+                remote_ref = "refs/heads/" + branch
                 plan.steps.extend([
                     GitStep("Check whitespace errors", "git diff --check"),
+                    GitStep("Check staged whitespace errors", "git diff --cached --check"),
                     GitStep("Stage all approved changes", "git add -A", True),
+                    GitStep("Check approved staged whitespace", "git diff --cached --check"),
                     GitStep("Show staged summary", "git diff --cached --stat"),
                     GitStep("Create Git commit", f"git commit -m {_quote(message)}", True),
-                    GitStep("Push current branch to origin", push_cmd, True),
+                    GitStep("Push current branch to origin", f"git push --no-follow-tags -u origin {_quote('HEAD:' + remote_ref)}", True),
+                    GitStep("Read committed revision", "git rev-parse --verify HEAD"),
+                    GitStep("Verify origin branch revision", f"git ls-remote --exit-code --refs {_quote(urls[0])} {_quote(remote_ref)}"),
                 ])
+                from iceman.redaction import redact_text
+                plan.notes.append("Destination: " + redact_text(urls[0]) + " (branch " + branch + ").")
+                plan.notes.append(f"The plan stages all {len(changed)} changed repository paths. Existing committed history may also be published; this scan does not audit history.")
+                plan.notes.append("This single approval covers staging all repository changes, committing with the displayed message, pushing this branch to origin, and verifying the remote revision.")
 
         elif action == GitAction.GITHUB_CREATE_REPO:
             if not repo:
@@ -493,43 +637,53 @@ def execute_git_plan(
     started = time.monotonic()
     if not plan.safe_to_execute:
         return GitExecutionResult(plan=plan, success=False, error="Plan is not safe to execute.")
+    compound = plan.request.action == GitAction.COMMIT_PUSH
+    if compound:
+        try:
+            if not plan.preflight_fingerprint or _compound_fingerprint(plan.workspace, scan=True) != plan.preflight_fingerprint:
+                raise ValueError("The repository changed after the preview. Request a new plan and approve it before staging.")
+        except (OSError, ValueError) as exc:
+            return GitExecutionResult(plan=plan, success=False, error=str(exc), duration_seconds=time.monotonic() - started)
 
     results: list[GitStepResult] = []
+
+    def partial_summary() -> list[str]:
+        if not compound:
+            return []
+        completed = {entry.step.label for entry in results if entry.result.returncode == 0 and not entry.result.interrupted}
+        if "Push current branch to origin" in completed:
+            return ["The local commit was created and the push command completed; remote verification is incomplete."]
+        if "Create Git commit" in completed:
+            return ["The local commit was created. The push has not been verified; no automatic rollback was performed."]
+        if "Stage all approved changes" in completed:
+            return ["Changes were staged before this workflow stopped; no automatic rollback was performed."]
+        return []
+
     total = len(plan.steps)
     for index, step in enumerate(plan.steps, 1):
         try:
+            if compound and step.label == "Stage all approved changes":
+                if _compound_fingerprint(plan.workspace, scan=True) != plan.preflight_fingerprint:
+                    return GitExecutionResult(plan=plan, success=False, step_results=results, error="The repository changed after the preview. Request a new plan before staging.", duration_seconds=time.monotonic() - started)
             result = step_runner(step, index, total) if step_runner else run_command(step.command, cwd=plan.workspace)
         except KeyboardInterrupt:
-            return GitExecutionResult(
-                plan=plan,
-                success=False,
-                step_results=results,
-                error="Execution interrupted by operator.",
-                duration_seconds=time.monotonic() - started,
-                interrupted=True,
-            )
-        except (FileNotFoundError, OSError) as exc:
-            return GitExecutionResult(
-                plan=plan,
-                success=False,
-                step_results=results,
-                error=str(exc),
-                duration_seconds=time.monotonic() - started,
-            )
+            return GitExecutionResult(plan=plan, success=False, step_results=results, summary=partial_summary(), error="Execution interrupted by operator.", duration_seconds=time.monotonic() - started, interrupted=True)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return GitExecutionResult(plan=plan, success=False, step_results=results, summary=partial_summary(), error=str(exc), duration_seconds=time.monotonic() - started)
         results.append(GitStepResult(step=step, result=result))
         if result.interrupted or result.returncode != 0:
             return GitExecutionResult(
-                plan=plan,
-                success=False,
-                step_results=results,
-                error=(
-                    f"Execution interrupted during: {step.label}"
-                    if result.interrupted
-                    else f"'{step.label}' exited with code {result.returncode}."
-                ),
-                duration_seconds=time.monotonic() - started,
-                interrupted=result.interrupted,
+                plan=plan, success=False, step_results=results, summary=partial_summary(),
+                error=(f"Execution interrupted during: {step.label}" if result.interrupted else f"'{step.label}' exited with code {result.returncode}."),
+                duration_seconds=time.monotonic() - started, interrupted=result.interrupted,
             )
+
+    if compound:
+        local = results[-2].result.stdout.strip() if len(results) >= 2 else ""
+        remote_rows = [line.split() for line in results[-1].result.stdout.splitlines()] if results else []
+        expected_ref = "refs/heads/" + (plan.branch or "")
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", local) or [local, expected_ref] not in remote_rows:
+            return GitExecutionResult(plan=plan, success=False, step_results=results, summary=partial_summary(), error="The push command completed, but origin's branch revision could not be verified against the local commit.", duration_seconds=time.monotonic() - started)
 
     summary: list[str] = []
     if plan.request.action == GitAction.INIT:
@@ -540,17 +694,10 @@ def execute_git_plan(
         summary.append("Git commit created successfully.")
     elif plan.request.action == GitAction.PUSH:
         summary.append("Current branch pushed to origin successfully.")
-    elif plan.request.action == GitAction.COMMIT_PUSH:
-        summary.append("Changes were staged, committed, and pushed successfully.")
+    elif compound:
+        summary.append("Changes were staged and committed, and origin's branch was verified at the same commit.")
     elif plan.request.action == GitAction.TAG:
         summary.append(f"Milestone tag created: {plan.request.tag}")
     elif plan.request.action == GitAction.PUSH_TAG:
         summary.append(f"Milestone tag published to origin: {plan.request.tag}")
-
-    return GitExecutionResult(
-        plan=plan,
-        success=True,
-        step_results=results,
-        summary=summary,
-        duration_seconds=time.monotonic() - started,
-    )
+    return GitExecutionResult(plan=plan, success=True, step_results=results, summary=summary, duration_seconds=time.monotonic() - started)

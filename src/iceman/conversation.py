@@ -54,6 +54,8 @@ _TECHNICAL_WORDS = {
     "linux",
     "directory",
     "folder",
+    "folders",
+    "directories",
     "file",
     "files",
     "permission",
@@ -263,7 +265,7 @@ _REPEAT_PHRASES = {
 
 
 def _strip_polite_fillers(text: str) -> str:
-    value = " ".join(text.strip().split())
+    value = text.strip()
     prefixes = (
         r"^can\s+you\s+please\s+",
         r"^could\s+you\s+please\s+",
@@ -320,26 +322,51 @@ def _best_technical_word(token: str) -> str | None:
 
 
 def _correct_technical_typos(text: str) -> tuple[str, tuple[tuple[str, str], ...]]:
-    # Do not fuzzy-normalize destructive requests. Those must reach the normal
-    # safety/fallback path without Iceman guessing what destructive verb meant.
+    # Never normalize a payload or resource into a different action/target.
+    if re.match(r"^(?:copy|move|rename|find|cat|chmod)\b", text, re.I):
+        return text, ()
     words = {item.lower() for item in re.findall(r"[A-Za-z]+", text)}
     if words & _DESTRUCTIVE_TERMS:
         return text, ()
-
+    protected: list[tuple[int, int]] = [
+        m.span() for m in re.finditer(
+            r"""(?<!\w)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|[^\s]*[/\\.:@=][^\s]*""",
+            text,
+        )
+    ]
+    tool_args = re.match(r"^(?:git|docker|terraform|kubectl|kubernetes)\s+\S+\s+", text, re.I)
+    if tool_args:
+        protected.append((tool_args.end(), len(text)))
+    message = re.search(r"\b(?:commit|comit|commt|commmit)\b.*?\b(?:message|as)\s+", text, re.I)
+    if message:
+        protected.append((message.end(), len(text)))
+    # Resource resolution happens later against real workspace entities. The
+    # language pass must not silently turn a name into a technical keyword.
+    for match in re.finditer(
+        r"\b(?:logs|describe|scale|restart|stop|copy|move|named|called|for|from|into|"
+        r"container|pod|deployment|service|namespace|context|branch|remote|file|folder)\s+(\S+)",
+        text, re.I,
+    ):
+        protected.append(match.span(1))
     corrections: list[tuple[str, str]] = []
 
     def repl(match: re.Match[str]) -> str:
-        token = match.group(0)
+        if any(start <= match.start() < end for start, end in protected):
+            return match.group()
+        token = match.group()
         replacement = _best_technical_word(token)
         if replacement is None:
+            return token
+        # Fuzzy edits to action verbs are never inferred; reviewed spellings
+        # still require the normal explicit interpretation confirmation.
+        if replacement in {"stage", "commit", "push", "run", "restart", "scale",
+                           "create", "add", "make", "change", "deploy", "remove",
+                           "stop", "start", "build", "initialize", "format"} and token.lower() not in _COMMON_MISSPELLINGS:
             return token
         corrections.append((token, replacement))
         return replacement
 
-    normalized = re.sub(r"\b[A-Za-z]{3,}\b", repl, text)
-    return normalized, tuple(corrections)
-
-
+    return re.sub(r"\b[A-Za-z]{3,}\b", repl, text), tuple(corrections)
 
 
 def _repair_common_grammar(text: str) -> tuple[str, tuple[tuple[str, str], ...]]:
@@ -348,7 +375,7 @@ def _repair_common_grammar(text: str) -> tuple[str, tuple[tuple[str, str], ...]]
     These rewrites only produce trusted natural-language intent text; they never
     produce shell syntax. Material rewrites are confirmed by the operator.
     """
-    value = " ".join(text.strip().split())
+    value = text.strip()
     lower = value.lower().strip().rstrip("?!.")
     repairs: list[tuple[str, str]] = []
 

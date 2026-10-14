@@ -22,6 +22,7 @@ class LinuxAction(str, Enum):
     SHOW_FILE = "linux_show_file"
     COPY = "linux_copy"
     MOVE = "linux_move"
+    DELETE_FILE = "linux_delete_file"
     MAKE_EXECUTABLE = "linux_make_executable"
     SHOW_PERMISSIONS = "linux_show_permissions"
     DISK_USAGE = "linux_disk_usage"
@@ -192,15 +193,66 @@ def build_linux_plan(workspace: Path, request: LinuxRequest) -> LinuxPlan:
 
         elif action in {LinuxAction.COPY, LinuxAction.MOVE}:
             source_raw = _clean_path(request.path)
-            dest_raw = _clean_path(request.destination)
             source = _mutation_path(workspace, source_raw, must_exist=True)
+
+            if request.destination is None or not request.destination.strip():
+                verb = "copy" if action == LinuxAction.COPY else "move"
+                source_display = _display_rel(workspace, source)
+                raise ValueError(
+                    f"A destination is required. Where should I {verb} "
+                    f"{source_display}? No command was executed."
+                )
+
+            dest_raw = _clean_path(request.destination)
             dest = _mutation_path(workspace, dest_raw)
+
             if source == dest:
                 raise ValueError("Source and destination are the same path.")
+
             command = "cp" if action == LinuxAction.COPY else "mv"
             label = "Copy path" if action == LinuxAction.COPY else "Move path"
             plan.steps.append(
                 LinuxStep(label, f"{command} -- {_quote(str(source))} {_quote(str(dest))}", True)
+            )
+
+        elif action == LinuxAction.DELETE_FILE:
+            path = _clean_path(request.path)
+
+            # Check the lexical entry before resolving it so a symlink can never
+            # cause Iceman to delete the file it points at.
+            raw = Path(path).expanduser()
+            lexical_target = raw if raw.is_absolute() else workspace / raw
+
+            if lexical_target.is_symlink():
+                raise ValueError(
+                    "Iceman will not delete symbolic links through this action "
+                    "because their target semantics can be surprising."
+                )
+
+            target = _mutation_path(workspace, path, must_exist=True)
+
+            relative = target.relative_to(workspace)
+            if relative.parts and relative.parts[0] == ".git":
+                raise ValueError(
+                    "Deletion inside .git is blocked to protect repository metadata."
+                )
+
+            if not target.is_file():
+                raise ValueError(
+                    "This trusted delete action removes regular files only. "
+                    "Recursive directory deletion and rm -rf are not supported."
+                )
+
+            plan.steps.append(
+                LinuxStep(
+                    "Delete file",
+                    f"rm -- {_quote(str(target))}",
+                    True,
+                )
+            )
+            plan.notes.append(
+                "Deletion is irreversible at the filesystem level. "
+                "Iceman will remove only the exact file shown after approval."
             )
 
         elif action == LinuxAction.MAKE_EXECUTABLE:

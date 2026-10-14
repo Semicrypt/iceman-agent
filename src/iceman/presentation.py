@@ -31,6 +31,7 @@ from iceman.devops_actions import (
     execute_devops_plan,
 )
 from iceman.linux_actions import (
+    LinuxAction,
     LinuxExecutionResult,
     LinuxPlan,
     execute_linux_plan,
@@ -50,6 +51,14 @@ from iceman.application_remediation import (
 from iceman.terraform_remediation import TerraformRemediationAdvice
 from iceman.runner import CommandBlockedError, run_command, run_command_streaming
 from iceman.safety import check_command
+
+
+def show_response_footer() -> None:
+    """Show Iceman's standard development/feedback notice."""
+    console.print(
+        "\n[dim]Iceman can make mistakes and is under continuous development. "
+        "Feedback, suggestions, and opinions are always welcome.[/dim]"
+    )
 
 
 def print_banner(version: str) -> None:
@@ -108,7 +117,8 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def _terminal_text(value: str) -> str:
-    return escape(_ANSI_ESCAPE_RE.sub("", value))
+    from iceman.redaction import redact_text
+    return escape(redact_text(_ANSI_ESCAPE_RE.sub("", value)))
 
 
 def execute_with_confirmation(
@@ -131,7 +141,7 @@ def execute_with_confirmation(
         from typer import confirm
         if not confirm("Execute this command?"):
             console.print("[yellow]Cancelled.[/yellow]")
-            return 0
+            return 1
 
     console.print("[dim]Live execution progress enabled.[/dim]")
     heartbeat_count = 0
@@ -636,30 +646,14 @@ def show_ai_provider_status(status: ProviderStatus) -> None:
 
 
 def show_ai_route(result: AIReasoningResult) -> None:
+    from iceman.redaction import redact_text
+
+    if result.intent.action.value in {"project_review", "project_followup", "fallback"}:
+        return
     console.print("[bold cyan]Advanced Intelligence[/bold cyan]")
-    route_target = result.intent.target
-    if route_target is None and result.intent.devops_action is not None:
-        route_target = result.intent.devops_action.value
-    if route_target is None and getattr(result.intent, "git_action", None) is not None:
-        route_target = result.intent.git_action.value
-    console.print(
-        f"[bold]Intent:[/bold] {result.intent.action.value}"
-        + (
-            f" → {route_target}"
-            if route_target
-            else ""
-        )
-    )
-    console.print(
-        f"[bold]Reasoning:[/bold] {result.intent.rationale}"
-    )
-
+    console.print(redact_text(result.intent.rationale), markup=False)
     if result.used_fallback:
-        console.print(
-            "[yellow]Advanced Intelligence is currently using Iceman's "
-            "local reasoning fallback.[/yellow]"
-        )
-
+        console.print("Using local reasoning because the configured provider is unavailable.", markup=False)
 
 
 def show_root_cause_investigation(
@@ -1911,6 +1905,119 @@ def execute_linux_plan_with_confirmation(plan: LinuxPlan) -> LinuxExecutionResul
     return result
 
 
+def _explain_permission_stat_line(line: str) -> list[str]:
+    """Translate GNU stat permission output into plain English."""
+    parts = line.strip().split(maxsplit=3)
+
+    if len(parts) != 4:
+        return []
+
+    symbolic, numeric, ownership, path = parts
+
+    if len(symbolic) < 10 or not numeric.isdigit() or ":" not in ownership:
+        return []
+
+    mode = symbolic[1:10]
+    if len(mode) != 9:
+        return []
+
+    owner, group = ownership.split(":", 1)
+    is_directory = symbolic.startswith("d")
+
+    owner_bits = mode[0:3]
+    group_bits = mode[3:6]
+    other_bits = mode[6:9]
+
+    def capabilities(bits: str) -> list[str]:
+        read = bits[0] == "r"
+        write = bits[1] == "w"
+        execute = bits[2] in {"x", "s", "t"}
+
+        result: list[str] = []
+
+        if is_directory:
+            if read:
+                result.append("list its contents")
+            if write:
+                result.append("change directory entries")
+            if execute:
+                result.append("enter/traverse it")
+        else:
+            if read:
+                result.append("read the file")
+            if write:
+                result.append("modify the file")
+            if execute:
+                result.append("run/execute the file")
+
+        return result
+
+    def describe(role: str, bits: str) -> str:
+        allowed = capabilities(bits)
+
+        if not allowed:
+            return f"{role}: has no read, write, or execute permission."
+
+        if len(allowed) == 1:
+            text = allowed[0]
+        elif len(allowed) == 2:
+            text = f"{allowed[0]} and {allowed[1]}"
+        else:
+            text = ", ".join(allowed[:-1]) + f", and {allowed[-1]}"
+
+        return f"{role}: can {text}."
+
+    object_name = "directory" if is_directory else "file"
+
+    lines = [
+        f"Type: {object_name}",
+        f"Owner ({owner}): {describe('', owner_bits).removeprefix(': ')}",
+        f"Group ({group}): {describe('', group_bits).removeprefix(': ')}",
+        f"Everyone else: {describe('', other_bits).removeprefix(': ')}",
+        f"Numeric mode: {numeric}",
+    ]
+
+    owner_write = owner_bits[1] == "w"
+    group_write = group_bits[1] == "w"
+    others_write = other_bits[1] == "w"
+    group_exec = group_bits[2] in {"x", "s", "t"}
+    others_exec = other_bits[2] in {"x", "s", "t"}
+
+    if others_write:
+        lines.append(
+            "Security note: everyone else can modify this "
+            f"{object_name}; this is broadly writable."
+        )
+    elif group_write:
+        lines.append(
+            f"Security note: members of group '{group}' can modify this "
+            f"{object_name}, but everyone else cannot."
+        )
+    elif owner_write:
+        lines.append(
+            f"Security note: only owner '{owner}' has write permission "
+            f"from these mode bits."
+        )
+
+    if not is_directory and others_exec:
+        lines.append(
+            "Execution note: everyone else can also run/execute this file."
+        )
+    elif not is_directory and group_exec:
+        lines.append(
+            f"Execution note: owner '{owner}' and members of group "
+            f"'{group}' can run/execute this file."
+        )
+
+    if any(char in symbolic for char in "sStT"):
+        lines.append(
+            "Advanced note: special permission bits are present "
+            "(setuid, setgid, or sticky-bit semantics)."
+        )
+
+    return lines
+
+
 def show_linux_result(
     result: LinuxExecutionResult, *, include_step_output: bool = True
 ) -> None:
@@ -1930,6 +2037,30 @@ def show_linux_result(
             f"\n[bold green]Linux workflow completed successfully.[/bold green] "
             f"[dim]Total: {_format_elapsed(result.duration_seconds)}[/dim]"
         )
+
+        if result.plan.request.action == LinuxAction.SHOW_PERMISSIONS:
+            explanation: list[str] = []
+
+            for item in result.step_results:
+                if item.result.returncode != 0 or not item.result.stdout:
+                    continue
+
+                for output_line in item.result.stdout.splitlines():
+                    parsed = _explain_permission_stat_line(output_line)
+                    if parsed:
+                        explanation = parsed
+                        break
+
+                if explanation:
+                    break
+
+            if explanation:
+                console.print("\n[bold]Permission meaning[/bold]")
+                for explanation_line in explanation:
+                    console.print(
+                        f"  • {_terminal_text(explanation_line)}"
+                    )
+
         for line in result.summary:
             console.print(f"  • {_terminal_text(line)}")
     else:
@@ -2027,6 +2158,8 @@ def show_git_result(result: GitExecutionResult, *, include_step_output: bool = T
             f"{_terminal_text(result.error or 'Unknown error')} "
             f"[dim]Total: {_format_elapsed(result.duration_seconds)}[/dim]"
         )
+        for line in result.summary:
+            console.print(_terminal_text(line), markup=False)
         if result.interrupted:
             total = len(result.plan.steps)
             completed = sum(1 for item in result.step_results if item.result.returncode == 0 and not item.result.interrupted)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
 
 
@@ -29,6 +30,13 @@ _BLOCKED_PATTERNS: tuple[tuple[str, str], ...] = (
 
 def check_command(command: str) -> SafetyResult:
     normalized = command.strip().lower()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return SafetyResult(False, "invalid command arguments")
+    # A commit message is literal data, not a command to classify.
+    if len(argv) == 4 and argv[:3] == ["git", "commit", "-m"]:
+        normalized = "git commit"
 
     if not normalized:
         return SafetyResult(False, "empty command")

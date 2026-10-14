@@ -2,6 +2,125 @@
 
 Iceman is a safety-first Cloud/DevOps CLI agent with pluggable AI reasoning.
 
+## Installed commands and one-shot requests
+
+The package installs two equivalent commands: `iceman` and `ice`.
+Run either with no arguments to open the interactive shell, or give it a
+natural-language request to run one workflow and return to your terminal:
+
+```bash
+iceman
+ice --version
+ice analyze plan
+ice git push
+ice stage everything
+ice status
+ice git status
+ice show git status
+ice list my folders
+ice show files here
+ice analyze my current folder and files
+ice inspect current folder
+ice "show me the containers"
+ice commit my changes with message "feat: add health checks"
+iceman ask "analyze terraform plan"
+```
+
+`analyze plan` (or `analyze the plan`) means the existing Terraform plan
+analysis workflow. It discovers Terraform configuration in the current workspace,
+previews the trusted commands, and reports planned resource changes; it does not
+apply infrastructure changes.
+
+`ice status` shows the current workspace and fresh Iceman session context,
+matching `status` inside the interactive shell. This exact shortcut is handled
+locally without an AI call, external commands, or an approval prompt. It works
+outside a Git repository and does not restore earlier interactive session history.
+Use `ice git status` for Git working-tree status; its command preview and explicit
+execution approval are unchanged. `iceman` with no arguments still opens the shell.
+
+`ice list my folders`, `ice list folders`, `ice list my files`, and
+`ice show files here` list the current directory contents, including both files
+and folders, through the existing read-only Linux listing action. Iceman shows
+the exact command and asks for approval before running it.
+
+`ice analyze my current folder and files`, `ice analyze this folder`,
+`ice inspect current folder`, and `ice analyze current directory` reuse the
+read-only project inspector to detect technologies and report scanned files.
+They do not run shell commands or change files.
+
+One-shot requests use the directory where you invoke the command as their
+workspace. They use the same configured reasoning provider, typed trusted actions,
+Advisor, safety checks, typo/entity clarification, exact-command preview, and
+approval gates as the interactive shell. For example, `ice stage everything`
+runs the existing pre-commit safety review, and `ice git push` requires approval
+before pushing. Requests are never executed as arbitrary shell text.
+
+"One-shot" means no Iceman shell loop. When a workflow needs approval or
+clarification, it still asks. Declining or reaching end-of-input stops the request
+with a nonzero exit status. Natural-language requests, including `ask`, do not
+offer `--yes`/`-y`; this replaces the older planner-only `ask --yes` behavior.
+The explicit `exec` command retains its existing safety-checked `--yes` option.
+
+Built-in commands (`doctor`, `inspect`, `check`, `investigate`, `diagnose`,
+`ai-status`, `version`, `exec`, and `ask`) retain their own argument parsing.
+The complete multi-word phrase `inspect current folder` (and close current-folder
+variants) also works directly; a single path argument still means `inspect [PATH]`.
+Use `ask` for other natural-language requests that start with a built-in command name:
+
+```bash
+ice inspect /path/to/project
+ice ask check this project and tell me if anything is wrong
+ice ask diagnose pod backend-abc
+ice ask "investigate why the backend is down"
+```
+
+Both quoted requests and multiple words work. Quote shell metacharacters and
+wildcards so your terminal does not interpret them before Iceman sees them.
+Each one-shot invocation starts fresh session context. Use the interactive shell
+for follow-ups such as `fix it`, `apply file plan`, or `rollback file changes`.
+A one-shot request such as `ice change folder to Works` cannot change the parent
+terminal's directory and does not persist a workspace for future invocations.
+Iceman explains this and exits without changing workspace. Run `cd -- Works` in
+your terminal before the next `ice` request, or open `iceman` and change workspace
+inside that interactive session. Interactive workspace changes apply to later
+requests in that session; they still do not change the parent terminal's directory.
+
+Successful requests exit with status 0; unknown requests, blocked plans,
+declined approvals, missing context, or failed workflows exit nonzero.
+Invalid CLI arguments exit with status 2.
+
+### Refresh the development installation
+
+From this local checkout, install or refresh the editable pipx package:
+
+```bash
+pipx install --force --editable ~/iceman-agent
+pipx list
+command -v iceman
+command -v ice
+cd /tmp
+iceman --version
+ice --version
+ice --help
+```
+
+Ensure `~/.local/bin` is on PATH (use `pipx ensurepath` and reopen your terminal
+if needed). Source edits remain linked to the checkout; refresh the installation
+when packaging entry points change so pipx exposes the new command.
+
+This change does not publish a release. A future wheel/package installation will
+install both entry points; public installation instructions depend on a separate
+package release.
+
+### Run the tests
+
+```bash
+source .venv/bin/activate
+python -m pytest -q
+git diff --check
+```
+
+
 
 ## v0.9.7 — Git & GitHub Natural-Language Intelligence
 
@@ -1532,3 +1651,59 @@ port 5000 isn't working
 ```
 
 Component-aware requests use the trusted `docker_connectivity` workflow. Iceman inspects runtime state and published ports, checks ownership of a specifically mentioned host port, and may perform one bounded HTTP GET against `127.0.0.1` when exactly one published host port is unambiguous. A failed localhost probe is treated as diagnostic evidence rather than a reason to abandon the rest of the explanation. Iceman does not scan ports, probe arbitrary remote hosts, or allow the AI provider to construct shell commands.
+
+## Conversational project reviews
+
+Run `ice what do you think about this project?` from a project directory, or start
+`iceman` for an interactive conversation. Other examples:
+
+```text
+ice what do you think i should improve?
+ice any good suggestion?
+ice what do you think is missing?
+ice is this project production ready?
+ice review this project for security risks
+ice stage everything, commit with the message 'example' and push to github
+```
+
+Project advice works locally without an API key. It inspects bounded source and
+configuration evidence for stack/structure, Docker/Compose, Kubernetes,
+Terraform AWS/Azure definitions, CI, documentation, and operational safeguards.
+Findings include file locations and distinguish observed configuration from
+suggestions or missing evidence. Static heuristics do not certify production
+readiness or identify confirmed CVEs. Optional scanner availability is reported;
+scanners, tests, cloud queries, and live runtime diagnostics are not automatically
+run as part of this file review. Existing trusted diagnostic actions remain
+available separately with their normal previews and approvals.
+
+In interactive `iceman`, follow a review with `why?`, `go deeper`, `what else?`,
+`show me the evidence`, or `what should I do first?`. `fix the highest risk`
+explains the recommended change; it does not apply arbitrary edits. Request a
+specific supported file plan or action to preview and approve changes. Changing
+workspace clears previous targets and plans. Each one-shot `ice` process starts
+with fresh context; review follow-ups across separate processes are not persisted.
+
+The combined Git workflow prepares one plan and asks once before staging,
+committing, pushing the current branch to its configured `origin`, and checking
+that the remote revision matches. The phrase “to github” uses the configured
+origin; it does not create or replace a remote. It refuses ambiguous or unsupported
+chains before executing a prefix, blocks common sensitive paths/secret signatures,
+and rechecks repository state before staging. It must be run at the repository
+root and conservatively refuses changed symlinks/submodules. Existing committed
+history can also be published; the preflight scan is not a complete history audit.
+If a later step fails, earlier completed steps are reported and are not silently
+rolled back. Staged-only commit-and-push requests require clarification because
+this combined workflow stages all changes.
+
+Common spelling corrections are bounded, with confirmation before a repaired
+state-changing request. Quoted text, paths, resource arguments, and commit
+messages are treated as literal data. Quote shell metacharacters as usual; an
+interactive request can retain quotation marks around a complex commit message.
+OpenAI remains optional for semantic interpretation using the strict trusted-action
+schema and redacted structured context. AI output cannot supply shell commands.
+
+Developer validation for this redesign includes `tests/test_conversational_router.py`,
+`tests/test_project_advisor.py`, `tests/test_conversation_integration.py`,
+`tests/test_git_compound_workflow.py`, and `tests/test_cli_live_conversation.py`.
+The live tests use the installed global `ice` in temporary directories and only
+push to a disposable local bare remote.

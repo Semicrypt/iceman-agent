@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TrustedAction(str, Enum):
+    PROJECT_REVIEW = "project_review"
+    PROJECT_FOLLOWUP = "project_followup"
     ASSESS_PROJECT = "assess_project"
     PRIORITIZE = "prioritize"
     DIAGNOSE_CONTAINER = "diagnose_container"

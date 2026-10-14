@@ -10,7 +10,10 @@ from iceman.session import SessionState
 
 
 _ACTION_MAP = {
+    ReasoningAction.PROJECT_REVIEW: TrustedAction.PROJECT_REVIEW,
+    ReasoningAction.PROJECT_FOLLOWUP: TrustedAction.PROJECT_FOLLOWUP,
     ReasoningAction.ASSESS: TrustedAction.ASSESS_PROJECT,
+    ReasoningAction.INSPECT: TrustedAction.INSPECT_PROJECT,
     ReasoningAction.PRIORITIZE: TrustedAction.PRIORITIZE,
     ReasoningAction.DIAGNOSE: TrustedAction.DIAGNOSE_CONTAINER,
     ReasoningAction.EXPLAIN: TrustedAction.EXPLAIN_CONTEXT,

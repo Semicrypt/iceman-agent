@@ -21,7 +21,10 @@ from iceman.language_understanding import (
 
 
 class ReasoningAction(str, Enum):
+    PROJECT_REVIEW = "project_review"
+    PROJECT_FOLLOWUP = "project_followup"
     ASSESS = "assess"
+    INSPECT = "inspect"
     PRIORITIZE = "prioritize"
     DIAGNOSE = "diagnose"
     EXPLAIN = "explain"
@@ -349,8 +352,8 @@ def _extract_devops_action_request(
     text: str,
     state: SessionState,
 ) -> ReasoningDecision | None:
-    normalized = " ".join(text.strip().split())
-    lower = normalized.lower().rstrip("?!.")
+    normalized = text.strip()
+    lower = " ".join(normalized.lower().split()).rstrip("?!.")
     port = _extract_int(r"\bport\s+(\d{1,5})\b", normalized)
 
     # Git / GitHub natural-language workflows.
@@ -476,6 +479,33 @@ def _extract_devops_action_request(
                 component=match.group(1),
             )
 
+    if re.fullmatch(
+        r"start\\s+(?:(?:k8|k8s|kubernetes)\\s+)?(?:my\\s+)?minikube",
+        lower,
+    ):
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            "Start or resume the local Minikube Kubernetes cluster and verify it.",
+            devops_action=DevOpsAction.K8S_MINIKUBE_START,
+        )
+
+    if lower in {
+        "start minikube",
+        "start my minikube",
+        "start k8 minikube",
+        "start k8s minikube",
+        "start kubernetes minikube",
+        "start the minikube cluster",
+        "launch minikube",
+        "run minikube",
+        "bring up minikube",
+    }:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_DEVOPS_ACTION,
+            "Start or resume the local Minikube Kubernetes cluster and verify it.",
+            devops_action=DevOpsAction.K8S_MINIKUBE_START,
+        )
+
     if lower in {"show current kubernetes context", "show kubernetes context", "what kubernetes context am i using"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Show the current Kubernetes context.", devops_action=DevOpsAction.K8S_CONTEXT)
     if lower in {"show kubernetes contexts", "list kubernetes contexts", "show me kubernetes contexts"}:
@@ -563,6 +593,8 @@ def _extract_devops_action_request(
     if "terraform" in lower and "plan" in lower and any(word in lower for word in {"fail", "failing", "failed", "error", "broken", "wrong"}):
         return ReasoningDecision(ReasoningAction.EXECUTE_DEVOPS_ACTION, "Re-run the read-only Terraform plan so Iceman can surface the current planning failure.", devops_action=DevOpsAction.TERRAFORM_PLAN)
     if lower in {
+        "analyze plan",
+        "analyze the plan",
         "explain terraform plan",
         "explain the terraform plan",
         "explain what terraform will create",
@@ -796,6 +828,17 @@ def _extract_devops_action_request(
 
 
 
+def is_current_folder_inspection_request(prompt: str) -> bool:
+    """Match only whole requests to inspect the active folder, without a path."""
+    normalized = " ".join(prompt.lower().strip().split()).rstrip("?!.")
+    return re.fullmatch(
+        r"(?:analyze|analyse|inspect) "
+        r"(?:(?:(?:my|the) )?current(?: working)?|this|my) "
+        r"(?:folder|directory|project|workspace)(?: and (?:its |the |my )?files)?",
+        normalized,
+    ) is not None
+
+
 def _extract_linux_action_request(text: str) -> ReasoningDecision | None:
     normalized = " ".join(text.strip().split())
     lower = normalized.lower().rstrip("?!.")
@@ -803,8 +846,13 @@ def _extract_linux_action_request(text: str) -> ReasoningDecision | None:
     if lower in {"where am i", "what directory am i in", "show current directory", "show my current directory"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Show the active Linux directory.", linux_action=LinuxAction.PWD)
 
-    if lower in {"show files", "show me the files", "list files", "list the files", "what files are here", "show files here"}:
-        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "List files in the active directory.", linux_action=LinuxAction.LIST)
+    if lower == "what files are here" or re.fullmatch(
+        r"(?:list|show)(?: me)?(?: my| the)? "
+        r"(?:files(?: and folders)?|folders(?: and files)?|directories)"
+        r"(?: here| in (?:(?:my|the) )?(?:current|this)(?: working)? (?:folder|directory))?",
+        lower,
+    ):
+        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "List files and folders in the active directory.", linux_action=LinuxAction.LIST)
     if lower in {"show hidden files", "show all files", "list all files", "list hidden files", "show me hidden files"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "List all files including hidden entries.", linux_action=LinuxAction.LIST_ALL)
 
@@ -827,19 +875,227 @@ def _extract_linux_action_request(text: str) -> ReasoningDecision | None:
         if "/" in candidate or "." in candidate or candidate.lower() in {"dockerfile", "makefile"}:
             return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Show the requested file contents.", linux_action=LinuxAction.SHOW_FILE, path=candidate)
 
-    match = re.match(r"^copy\s+(.+?)\s+(?:to|into)\s+(.+)$", normalized, flags=re.IGNORECASE)
+    # Safe file-copy requests. Destinations are never invented.
+    match = re.match(
+        r"^make\s+a\s+copy\s+of\s+(.+?)\s+(?:as|to)\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     if match:
-        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Copy a path inside the active workspace.", linux_action=LinuxAction.COPY, path=match.group(1).strip(), destination=match.group(2).strip())
-    match = re.match(r"^move\s+(.+?)\s+(?:to|into)\s+(.+)$", normalized, flags=re.IGNORECASE)
-    if match:
-        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Move a path inside the active workspace.", linux_action=LinuxAction.MOVE, path=match.group(1).strip(), destination=match.group(2).strip())
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Copy a path inside the active workspace.",
+            linux_action=LinuxAction.COPY,
+            path=match.group(1).strip(),
+            destination=match.group(2).strip(),
+        )
 
-    match = re.match(r"^(?:make|set)\s+(.+?)\s+executable$", normalized, flags=re.IGNORECASE)
+    match = re.match(
+        r"^copy\s+(.+?)\s+(?:to|into|as)\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     if match:
-        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Add executable permission to the selected file.", linux_action=LinuxAction.MAKE_EXECUTABLE, path=match.group(1).strip())
-    match = re.match(r"^(?:show|check)\s+(?:the\s+)?permissions?(?:\s+for|\s+of)?\s+(.+)$", normalized, flags=re.IGNORECASE)
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Copy a path inside the active workspace.",
+            linux_action=LinuxAction.COPY,
+            path=match.group(1).strip(),
+            destination=match.group(2).strip(),
+        )
+
+    # Recognize a valid copy request even when destination is omitted.
+    # The Linux planner will stop safely and ask for the missing destination.
+    match = re.match(r"^copy\s+(.+)$", normalized, flags=re.IGNORECASE)
     if match:
-        return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Show file ownership and permissions.", linux_action=LinuxAction.SHOW_PERMISSIONS, path=match.group(1).strip())
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Copy request recognized, but a destination must be supplied before anything can run.",
+            linux_action=LinuxAction.COPY,
+            path=match.group(1).strip(),
+        )
+
+    # Rename is implemented through the existing trusted move action.
+    match = re.match(
+        r"^(?:move|rename)\s+(.+?)\s+(?:to|into|as)\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Move or rename a path inside the active workspace.",
+            linux_action=LinuxAction.MOVE,
+            path=match.group(1).strip(),
+            destination=match.group(2).strip(),
+        )
+
+    match = re.match(
+        r"^change\s+(.+?)\s+(?:name|filename)\s+to\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Rename a path inside the active workspace.",
+            linux_action=LinuxAction.MOVE,
+            path=match.group(1).strip(),
+            destination=match.group(2).strip(),
+        )
+
+    # Do not reinterpret destructive infrastructure requests as local-file
+    # deletion merely because they start with delete/remove/rm.
+    destructive_infrastructure_terms = {
+        "deployment",
+        "deployments",
+        "pod",
+        "pods",
+        "service",
+        "services",
+        "namespace",
+        "namespaces",
+        "cluster",
+        "clusters",
+        "node",
+        "nodes",
+        "statefulset",
+        "statefulsets",
+        "daemonset",
+        "daemonsets",
+        "job",
+        "jobs",
+        "cronjob",
+        "cronjobs",
+        "ingress",
+        "ingresses",
+        "configmap",
+        "configmaps",
+        "secret",
+        "secrets",
+        "pvc",
+        "pvcs",
+        "container",
+        "containers",
+        "image",
+        "images",
+        "instance",
+        "instances",
+        "vm",
+        "vms",
+        "vpc",
+        "vpcs",
+        "subnet",
+        "subnets",
+        "bucket",
+        "buckets",
+        "database",
+        "databases",
+        "terraform",
+        "infrastructure",
+        "resource",
+        "resources",
+    }
+
+    if (
+        re.match(r"^(?:delete|remove|rm)\b", lower)
+        and any(
+            re.search(rf"\b{re.escape(term)}\b", lower)
+            for term in destructive_infrastructure_terms
+        )
+    ):
+        return ReasoningDecision(
+            ReasoningAction.FALLBACK,
+            (
+                "Destructive infrastructure deletion is not exposed through "
+                "Iceman's trusted local-file deletion action."
+            ),
+        )
+
+    # Safe single-file deletion. Never accept rm flags such as -r/-f.
+    if re.match(r"^rm\s+-", lower) and not re.match(r"^rm\s+--\s+", lower):
+        return ReasoningDecision(
+            ReasoningAction.FALLBACK,
+            "Recursive/forced rm flags are not exposed through Iceman's trusted file deletion action.",
+        )
+
+    match = re.match(
+        r"^(?:delete|remove)\s+(?:the\s+)?(?:file\s+)?(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Delete one file inside the active workspace after explicit approval.",
+            linux_action=LinuxAction.DELETE_FILE,
+            path=match.group(1).strip(),
+        )
+
+    match = re.match(
+        r"^rm\s+(?:--\s+)?(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Delete one file inside the active workspace after explicit approval.",
+            linux_action=LinuxAction.DELETE_FILE,
+            path=match.group(1).strip(),
+        )
+
+    if lower in {"delete file", "remove file", "rm"}:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "A file path is required before anything can be deleted.",
+            linux_action=LinuxAction.DELETE_FILE,
+        )
+
+    # Longer conversational chmod form. Extract only the actual filename.
+    match = re.match(
+        r"^(?:make|set)\s+(?:the\s+)?"
+        r"(?:permissions?|permisons?|permions?)\s+"
+        r"(?:of|for)\s+(?:the\s+)?(?:file\s+)?"
+        r"(.+?)\s+and\s+(?:make|set)\s+(?:it|the\s+file)\s+executable$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Add executable permission to the selected file.",
+            linux_action=LinuxAction.MAKE_EXECUTABLE,
+            path=match.group(1).strip(),
+        )
+
+    match = re.match(
+        r"^(?:make|set)\s+(?:the\s+)?(?:file\s+)?(.+?)\s+executable$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Add executable permission to the selected file.",
+            linux_action=LinuxAction.MAKE_EXECUTABLE,
+            path=match.group(1).strip(),
+        )
+
+    match = re.match(
+        r"^(?:show|check)\s+(?:the\s+)?"
+        r"(?:permissions?|permisons?|permions?)"
+        r"(?:\s+for|\s+of)?\s+(.+)$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_LINUX_ACTION,
+            "Show file ownership and permissions.",
+            linux_action=LinuxAction.SHOW_PERMISSIONS,
+            path=match.group(1).strip(),
+        )
 
     if lower in {"show disk space", "show filesystem usage", "show free disk space", "how much disk space is left"}:
         return ReasoningDecision(ReasoningAction.EXECUTE_LINUX_ACTION, "Show filesystem capacity and free space.", linux_action=LinuxAction.FILESYSTEM_USAGE)
@@ -898,6 +1154,7 @@ _EXPLAIN_PHRASES = (
 )
 
 _SESSION_PHRASES = (
+    "status",
     "session",
     "show session",
     "show context",
@@ -995,8 +1252,74 @@ def _extract_apply_option(
     return None
 
 
+def conversation_decision(prompt: str, state: SessionState) -> ReasoningDecision | None:
+    """Resolve complete conversational requests before entity/provider routing."""
+    from iceman.conversational_router import route_conversation
+
+    route = route_conversation(prompt)
+    if route is None:
+        return None
+    if route.kind == "clarify":
+        return ReasoningDecision(ReasoningAction.FALLBACK, route.message,
+                                 requires_clarification=True)
+    if route.kind == "assessment":
+        # Keep the existing explicit folder-inspection command behavior.
+        if is_current_folder_inspection_request(interpret_prompt(prompt, state).normalized):
+            return None
+        return ReasoningDecision(ReasoningAction.PROJECT_REVIEW,
+                                 "I'll review the local project files and explain what the evidence supports.",
+                                 target=route.intent)
+    if route.kind == "followup":
+        review = state.last_project_review
+        if review is None and state.latest_problem_context() is not None and route.intent in {"why", "deeper", "first"}:
+            return None
+        return ReasoningDecision(ReasoningAction.PROJECT_FOLLOWUP,
+                                 "I'll use the last project review in this workspace.",
+                                 target=route.intent)
+    if route.kind == "git_workflow":
+        if not route.payload["stage_all"]:
+            return ReasoningDecision(
+                ReasoningAction.FALLBACK,
+                "Should this workflow stage all changes? Say 'stage all, commit as \"your message\", then push' to approve that scope, or commit the staged changes separately.",
+                requires_clarification=True,
+            )
+        return ReasoningDecision(
+            ReasoningAction.EXECUTE_GIT_ACTION,
+            "I'll prepare one plan to stage all changes, commit with your exact message, push, and verify.",
+            git_action=GitAction.COMMIT_PUSH,
+            commit_message=route.payload["commit_message"],
+            interpreted_request=route.normalized_text if route.normalized_text != prompt.strip() else None,
+            requires_clarification=route.normalized_text != prompt.strip(),
+        )
+    return None
+
+
 def reason_request(prompt: str, state: SessionState) -> ReasoningDecision:
-    interpretation = interpret_prompt(prompt, state)
+    from iceman.conversational_router import normalize_request
+
+    conversational = conversation_decision(prompt, state)
+    if conversational is not None:
+        return conversational
+    normalized = normalize_request(prompt)
+    interpretation = interpret_prompt(normalized, state)
+    if normalized != prompt.strip():
+        interpretation = replace(interpretation, original=prompt, requires_clarification=True)
+
+    # Current-folder requests have no named resource to resolve. Match them
+    # before separator grounding can mistake words such as "current folder"
+    # for an unrelated local directory named "current-folder".
+    if is_current_folder_inspection_request(interpretation.normalized):
+        return _decorate_interpretation(
+            ReasoningDecision(
+                ReasoningAction.INSPECT,
+                "Inspect the active folder and its files using read-only project detection.",
+            ),
+            interpretation,
+        )
+
+    listing = _extract_linux_action_request(interpretation.normalized)
+    if listing is not None and listing.linux_action in {LinuxAction.LIST, LinuxAction.LIST_ALL}:
+        return _decorate_interpretation(listing, interpretation)
 
     # Ground separator variants against resources that actually exist before
     # intent routing. This lets natural phrases such as "broken backend" match
@@ -1032,7 +1355,7 @@ def reason_request(prompt: str, state: SessionState) -> ReasoningDecision:
     if text in _SESSION_PHRASES:
         return ReasoningDecision(
             ReasoningAction.SESSION,
-            "Show the state Iceman is carrying in this interactive session.",
+            "Show the current Iceman workspace and session context.",
         )
 
     if any(phrase in text for phrase in _PRIORITY_PHRASES):
