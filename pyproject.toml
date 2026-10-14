@@ -6,9 +6,13 @@ build-backend = "hatchling.build"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 name = "agent-iceman"
-version = "0.11.0"
+version = "0.12.0"
 description = "Agent Iceman — a safety-first Cloud and DevOps CLI agent with pluggable AI reasoning."
 readme = "README.md"
+authors = [{ name = "Semicrypt" }]
+maintainers = [
+    { name = "Semicrypt", email = "nifeanyidivine@gmail.com" },
+]
 requires-python = ">=3.10"
 dependencies = [
   "typer>=0.27.2,<1.0",
@@ -16,6 +20,10 @@ dependencies = [
   "openai>=3.13.0,<4.0",
   "pydantic>=2.12,<3.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/Semicrypt/iceman-agent"
+Issues = "https://github.com/Semicrypt/iceman-agent/issues"
 
 [project.optional-dependencies]
 dev = [

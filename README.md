@@ -1767,6 +1767,8 @@ Linux distributions or architectures is not established by this workflow.
 
 Agent Iceman is licensed under the **Apache License, Version 2.0**.
 
+Copyright © 2026 Semicrypt.
+
 See the [LICENSE](LICENSE) file for the complete license terms.
 
 Copyright and attribution notices are retained by their respective owners.
