@@ -1,0 +1,207 @@
+name: Agent Iceman Official Release
+
+on:
+  workflow_dispatch:
+
+# Build-only CI: no release, tag, registry, or repository write permissions.
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-packages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build Linux AMD64 on Ubuntu 22.04
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel, standalone ice, and Debian package
+        env:
+          # This intentionally invalid address belongs only to CI test artifacts.
+          AGENT_ICEMAN_MAINTAINER: Semicrypt <nifeanyidivine@gmail.com>
+          PYTHON: python
+        run: bash scripts/build_linux.sh
+
+      - name: Upload CI packages and checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-iceman-linux-amd64-official
+          path: dist/linux/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  verify:
+    name: Install and verify on ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+    steps:
+      - name: Checkout verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python for clean wheel installation
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Download the Ubuntu 22.04 build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent-iceman-linux-amd64-official
+          path: ${{ runner.temp }}/agent-iceman-linux
+          digest-mismatch: error
+
+      - name: Verify checksums, package metadata, and wheel installation
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/agent-iceman-linux"
+          sha256sum --check --strict SHA256SUMS
+          shopt -s nullglob
+          wheels=(agent_iceman-*.whl)
+          debs=(agent-iceman_*_amd64.deb)
+          [[ ${#wheels[@]} -eq 1 && ${#debs[@]} -eq 1 ]]
+          [[ "$(dpkg-deb -f "${debs[0]}" Package)" == agent-iceman ]]
+          [[ "$(dpkg-deb -f "${debs[0]}" Architecture)" == amd64 ]]
+          [[ "$(dpkg-deb -f "${debs[0]}" Maintainer)" == 'Semicrypt <nifeanyidivine@gmail.com>' ]]
+          [[ "$(dpkg-deb -f "${debs[0]}" Depends)" == 'libc6 (>= 2.35), zlib1g' ]]
+          dpkg-deb --info "${debs[0]}"
+          dpkg-deb --contents "${debs[0]}"
+          # Artifact ZIP downloads do not preserve the standalone executable bit.
+          chmod 755 ice
+          file ice | grep -E 'ELF 64-bit.*x86-64'
+          python -m venv "$RUNNER_TEMP/agent-iceman-wheel"
+          "$RUNNER_TEMP/agent-iceman-wheel/bin/python" -m pip install "${wheels[0]}"
+          "$RUNNER_TEMP/agent-iceman-wheel/bin/python" -m pip check
+          "$RUNNER_TEMP/agent-iceman-wheel/bin/python" -I - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          import subprocess
+          import iceman
+
+          dist = distribution('agent-iceman')
+          assert dist.version == iceman.__version__
+          entries = {e.name: e.value for e in dist.entry_points if e.group == 'console_scripts'}
+          assert entries['ice'] == entries['iceman'] == 'iceman.cli:app'
+          deb = next(Path('.').glob('agent-iceman_*_amd64.deb'))
+          assert subprocess.check_output(['dpkg-deb', '-f', str(deb), 'Version'], text=True).strip() == dist.version + '-1'
+          PY
+
+      - name: Check offline CLI and Debian install/remove on this runner
+        run: |
+          set -euo pipefail
+          # This is the only step that installs/removes a system package.
+          [[ "$GITHUB_ACTIONS" == true && "$RUNNER_ENVIRONMENT" == github-hosted ]]
+          cd "$RUNNER_TEMP/agent-iceman-linux"
+          debs=(agent-iceman_*_amd64.deb)
+          version="$(dpkg-deb -f "${debs[0]}" Version)"
+          version="${version%-1}"
+          offline_smoke() {
+            # Disable networking, then drop root before executing any CLI checks.
+            sudo unshare --net -- setpriv \
+              --reuid="$(id -u)" --regid="$(id -g)" --init-groups -- \
+              /usr/bin/bash "$GITHUB_WORKSPACE/scripts/smoke_linux.sh" "$version" "$@"
+          }
+          offline_smoke "$RUNNER_TEMP/agent-iceman-wheel/bin/ice" \
+            "$RUNNER_TEMP/agent-iceman-wheel/bin/iceman" "$PWD/ice"
+          for path in /usr/bin/ice /usr/bin/iceman /opt/agent-iceman; do
+            [[ ! -e "$path" && ! -L "$path" ]]
+          done
+          if dpkg-query -W -f='${Status}' agent-iceman 2>/dev/null | grep -q 'installed'; then
+            echo 'Refusing to replace an existing system installation.' >&2
+            exit 1
+          fi
+          cleanup() { sudo dpkg --remove agent-iceman; }
+          trap cleanup EXIT
+          sudo dpkg --install "${debs[0]}"
+          [[ "$(dpkg-query -W -f='${Status}' agent-iceman)" == 'install ok installed' ]]
+          [[ "$(readlink /usr/bin/ice)" == /opt/agent-iceman/ice ]]
+          [[ "$(readlink /usr/bin/iceman)" == /opt/agent-iceman/ice ]]
+          cmp ice /opt/agent-iceman/ice
+          offline_smoke /usr/bin/ice /usr/bin/iceman
+          sudo dpkg --remove agent-iceman
+          trap - EXIT
+          for path in /usr/bin/ice /usr/bin/iceman /opt/agent-iceman; do
+            [[ ! -e "$path" && ! -L "$path" ]]
+          done
+          if dpkg-query -W -f='${Status}' agent-iceman 2>/dev/null | grep -q 'installed'; then
+            echo 'Package is still installed after removal.' >&2
+            exit 1
+          fi
+
+
+  publish:
+    name: Publish Agent Iceman v0.12.0
+    needs: [build, verify]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout verified source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Download verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: agent-iceman-linux-amd64-official
+          path: release-assets
+          digest-mismatch: error
+
+      - name: Verify official release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          grep -qx 'version = "0.12.0"' pyproject.toml
+          test "$GITHUB_REF" = refs/heads/main
+
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v0.12.0" >/dev/null 2>&1; then
+            echo "Release tag already exists. Refusing to overwrite."
+            exit 1
+          fi
+
+          cd release-assets
+          sha256sum --check --strict SHA256SUMS
+
+          test "$(dpkg-deb -f agent-iceman_0.12.0-1_amd64.deb Maintainer)" =             'Semicrypt <nifeanyidivine@gmail.com>'
+
+          dpkg-deb --contents agent-iceman_0.12.0-1_amd64.deb             | grep -F 'usr/share/doc/agent-iceman/LICENSE'
+
+          unzip -Z1 agent_iceman-0.12.0-py3-none-any.whl             | grep -F 'LICENSE'
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v0.12.0             release-assets/agent-iceman_0.12.0-1_amd64.deb             release-assets/agent_iceman-0.12.0-py3-none-any.whl             release-assets/ice             release-assets/SHA256SUMS             --repo "$GITHUB_REPOSITORY"             --target "$GITHUB_SHA"             --title "Agent Iceman v0.12.0"             --notes "First public release of Agent Iceman, the safety-first Cloud and DevOps CLI assistant.
+
+          Includes a standalone Linux AMD64 executable, Ubuntu Debian installer and Python wheel.
+
+          Verified on Ubuntu 22.04, 24.04 and 26.04. Apache License 2.0.
+
+          Ollama is optional and AI models are not bundled."
